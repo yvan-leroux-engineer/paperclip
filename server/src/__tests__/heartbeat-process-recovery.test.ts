@@ -4940,6 +4940,149 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("does not let a late cancellation overwrite a run that finalized during process termination", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    let terminateStarted!: () => void;
+    let releaseTermination!: () => void;
+    const terminationStarted = new Promise<void>((resolve) => {
+      terminateStarted = resolve;
+    });
+    const terminationCanFinish = new Promise<void>((resolve) => {
+      releaseTermination = resolve;
+    });
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      terminateStarted();
+      await terminationCanFinish;
+    });
+
+    const cancellation = heartbeat.cancelRun(runId, "probe cancellation");
+    await terminationStarted;
+    const finalized = await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+      .returning({ id: heartbeatRuns.id })
+      .then((rows) => rows[0] ?? null);
+    expect(finalized?.id).toBe(runId);
+    releaseTermination();
+
+    const cancellationResult = await cancellation;
+    expect(cancellationResult).toBeNull();
+    const finalRun = await db
+      .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(finalRun).toEqual({ status: "succeeded", error: null });
+    const finalWakeup = await db
+      .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]);
+    expect(finalWakeup).toEqual({ status: "claimed", error: null });
+  });
+
+  it("returns null when cancellation starts after a run is already terminal", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const cancellationResult = await heartbeatService(db).cancelRun(runId);
+
+    expect(cancellationResult).toBeNull();
+    const finalRun = await db
+      .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(finalRun).toEqual({ status: "succeeded", error: null });
+  });
+
+  it("does not terminate or release a bulk-cancel run when finalization wins the status race", async () => {
+    const { agentId, runId, wakeupRequestId, issueId } = await seedRunFixture({
+      agentStatus: "paused",
+      includeIssue: true,
+      processPid: 12345,
+    });
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+    const originalUpdate = db.update.bind(db);
+    const updateSpy = vi.spyOn(db, "update");
+    let interceptHeartbeatRunUpdate = true;
+    updateSpy.mockImplementation(((table: Parameters<typeof db.update>[0]) => {
+      if (table !== heartbeatRuns || !interceptHeartbeatRunUpdate) {
+        return originalUpdate(table);
+      }
+      interceptHeartbeatRunUpdate = false;
+      return {
+        set: (values: Partial<typeof heartbeatRuns.$inferInsert>) => ({
+          where: () => ({
+            returning: () => (async () => {
+              await originalUpdate(heartbeatRuns)
+                .set({ status: "succeeded", finishedAt: new Date() })
+                .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")));
+              return originalUpdate(heartbeatRuns)
+                .set(values)
+                .where(and(
+                  eq(heartbeatRuns.id, runId),
+                  inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+                ))
+                .returning();
+            })(),
+          }),
+        }),
+      } as unknown as ReturnType<typeof db.update>;
+    }) as typeof db.update);
+
+    try {
+      const cancelledCount = await heartbeat.cancelActiveForAgent(agentId);
+      expect(cancelledCount).toBe(0);
+      expect(mockTerminateLocalService).not.toHaveBeenCalled();
+      expect(runningProcesses.has(runId)).toBe(true);
+
+      const [finalRun, finalWakeup, finalIssue] = await Promise.all([
+        db
+          .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0]),
+        db
+          .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId))
+          .then((rows) => rows[0]),
+        db
+          .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]),
+      ]);
+      expect(finalRun).toEqual({ status: "succeeded", error: null });
+      expect(finalWakeup).toEqual({ status: "claimed", error: null });
+      expect(finalIssue).toEqual({ executionRunId: runId, checkoutRunId: runId });
+    } finally {
+      updateSpy.mockRestore();
+    }
+  });
+
   it("records manual cancellation stop metadata", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",

@@ -5095,7 +5095,7 @@ export function agentRoutes(
       });
     }
 
-    res.json(run);
+    res.json(run ?? await heartbeat.getRun(runId));
   });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {

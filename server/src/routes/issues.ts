@@ -3174,7 +3174,8 @@ export function issueRoutes(
 
     try {
       const cancelled = await heartbeat.cancelRun(scheduledRetryRunId);
-      const cancelledRunId = cancelled?.id ?? scheduledRetryRunId;
+      if (!cancelled) return null;
+      const cancelledRunId = cancelled.id;
       await logActivity(db, {
         companyId: input.issue.companyId,
         actorType: input.actor.actorType,

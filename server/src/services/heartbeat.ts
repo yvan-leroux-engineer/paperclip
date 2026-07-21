@@ -19129,7 +19129,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
-    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return null;
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     const resultJson = agent
@@ -19162,12 +19162,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    });
+    const cancelledWrite = await setRunStatusFromLive(
+      run.id,
+      "cancelled",
+      [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+      {
+        finishedAt,
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      },
+    );
+    if (!cancelledWrite.updated) return null;
+    const cancelled = cancelledWrite.run;
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -19199,20 +19206,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
+    let cancelledCount = 0;
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-        errorCode,
-        ...(agent ? {
-          resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-            resultJson: parseObject(run.resultJson),
-            errorCode,
-            errorMessage: reason,
-          }),
-        } : {}),
-      });
+      const cancelledWrite = await setRunStatusFromLive(
+        run.id,
+        "cancelled",
+        [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+        {
+          finishedAt: new Date(),
+          error: reason,
+          errorCode,
+          ...(agent ? {
+            resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
+              resultJson: parseObject(run.resultJson),
+              errorCode,
+              errorMessage: reason,
+            }),
+          } : {}),
+        },
+      );
+      const cancelled = cancelledWrite.updated ? cancelledWrite.run : null;
+      if (!cancelled) continue;
 
+      cancelledCount += 1;
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: new Date(),
         error: reason,
@@ -19232,10 +19248,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    return runs.length;
+    return cancelledCount;
   }
 
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
