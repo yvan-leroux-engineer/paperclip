@@ -425,6 +425,8 @@ Local adapters require their corresponding CLI/session setup on the machine runn
 
 Agent, project, environment, secret, skill, and workspace config edits are sampled at the next run boundary. A heartbeat that is already running finishes with the config it started with.
 
+Ordinary issue or project updates do not invalidate a saved adapter session only because their `updatedAt` value changed. Paperclip fingerprints the effective issue and project execution settings instead, so a real workspace policy or execution config change still starts a fresh session.
+
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
 ## Workspace Git Scan Protection

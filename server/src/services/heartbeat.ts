@@ -4925,11 +4925,13 @@ function buildSessionConfigCategoryValues(input: {
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(input.secretManifest);
   const workspaceConfig = { ...parseObject(input.workspaceConfig) };
-  // issues.updatedAt also advances for comments and status changes. Those are
-  // wake deltas, not execution-workspace configuration changes, so including
-  // the timestamp here makes every comment invalidate an otherwise reusable
-  // task session.
+  // Issue and project updatedAt values also advance for ordinary business
+  // changes. Those are wake deltas, not execution-workspace configuration
+  // changes, so including either timestamp invalidates an otherwise reusable
+  // task session. The effective issue/project execution settings remain in
+  // their dedicated fingerprint fields below.
   delete workspaceConfig.issueConfigRevisionAt;
+  delete workspaceConfig.projectConfigRevisionAt;
   return {
     adapter: {
       adapterType: input.adapterType,
@@ -14800,6 +14802,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceConfig: {
         requestedMode: requestedExecutionWorkspaceMode,
         effectiveMode: effectiveExecutionWorkspaceMode,
+        workspaceIdentity: {
+          projectId: issueContext?.projectId ?? null,
+          projectWorkspaceId: issueContext?.projectWorkspaceId ?? null,
+          executionWorkspaceId: issueContext?.executionWorkspaceId ?? null,
+        },
+        trustPreset,
         issueConfigRevisionAt: issueContext?.updatedAt instanceof Date
           ? issueContext.updatedAt.toISOString()
           : issueContext?.updatedAt ?? null,
