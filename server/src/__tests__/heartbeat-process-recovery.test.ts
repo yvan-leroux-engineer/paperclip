@@ -4010,6 +4010,178 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lateHealthyChildId).toBeTypeOf("string");
   });
 
+  it("does not merge a corrective handoff into an already-running adapter context", async () => {
+    const { companyId, agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const activeWakeupRequestId = randomUUID();
+    const activeRunId = randomUUID();
+    const copiedAdapterContext = {
+      issueId,
+      taskId: issueId,
+      wakeReason: "issue_commented",
+      commentId: randomUUID(),
+    };
+    await db.insert(agentWakeupRequests).values({
+      id: activeWakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId },
+      status: "claimed",
+      runId: activeRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: activeWakeupRequestId,
+      contextSnapshot: copiedAdapterContext,
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: activeRunId, executionLockedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "finish_successful_run_handoff",
+      payload: { issueId, sourceRunId: runId },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "finish_successful_run_handoff",
+        handoffRequired: true,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+    })).resolves.toBeNull();
+
+    const activeRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, activeRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(activeRun?.contextSnapshot).toEqual(copiedAdapterContext);
+    const handoffRows = await db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "finish_successful_run_handoff"));
+    expect(handoffRows).toEqual([]);
+    const superseded = await db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "successful_run_handoff_superseded"));
+    expect(superseded).toEqual([{ reason: "successful_run_handoff_superseded", status: "skipped" }]);
+  });
+
+  it("does not promote a deferred corrective handoff after the issue gains a durable path", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId, taskId: issueId },
+      finishedAt: new Date(),
+    });
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      runId: sourceRunId,
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      details: { sourceRunId },
+    });
+    const deferredWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        sourceRunId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          handoffRequired: true,
+        },
+      },
+      status: "deferred_issue_execution",
+      idempotencyKey: `finish_successful_run_handoff:${issueId}:${sourceRunId}:1`,
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: new Date(Date.now() + 60_000),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Persisted a monitor before finishing.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const deferred = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferred).toEqual({ status: "skipped", reason: "successful_run_handoff_superseded" });
+    const promotedRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, deferredWakeupRequestId));
+    expect(promotedRuns).toHaveLength(0);
+    const resolved = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_handoff_resolved"),
+      ));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      details: expect.objectContaining({ sourceRunId }),
+    }));
+  });
+
   it("recognizes canonical task wake encodings and ignores internal harness children", async () => {
     const { companyId, issueId } = await seedQueuedIssueRunFixture();
     const taskChildId = await seedDelegatedChild({
@@ -4178,6 +4350,90 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       entityId: issueId,
       details: expect.objectContaining({ childIssueId: cancelledChildId }),
     }));
+  });
+
+  it("preserves a cancelled child blocker that was recreated after the delegated-wait marker", async () => {
+    const { companyId, agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
+    const childIssueId = await seedDelegatedChild({
+      companyId,
+      parentId: issueId,
+      issueNumber: 2,
+      withDeferredWake: true,
+    });
+    const disposition = await claimSuccessfulRunDelegatedChildDisposition(db, {
+      run: { id: runId, agentId, wakeupRequestId },
+      sourceIssue: { id: issueId, companyId, identifier: null },
+    });
+    expect(disposition).toMatchObject({ kind: "converted" });
+
+    const originalRelation = await db
+      .select()
+      .from(issueRelations)
+      .where(and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.issueId, childIssueId),
+        eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(originalRelation).not.toBeNull();
+    const recreatedRelationId = randomUUID();
+    await db.delete(issueRelations).where(eq(issueRelations.id, originalRelation!.id));
+    await db.insert(issueRelations).values({
+      id: recreatedRelationId,
+      companyId,
+      issueId: childIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+      createdByAgentId: agentId,
+    });
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, childIssueId));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId, completedChildIssueId: childIssueId, childIssueIds: [childIssueId] },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_children_completed",
+        completedChildIssueId: childIssueId,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+    })).resolves.toBeNull();
+
+    const remainingRelationIds = await db
+      .select({ id: issueRelations.id })
+      .from(issueRelations)
+      .where(and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.issueId, childIssueId),
+        eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"),
+      ));
+    expect(remainingRelationIds).toEqual([{ id: recreatedRelationId }]);
+    const releaseActivities = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_delegated_cancelled_child_released"),
+      ));
+    expect(releaseActivities).toHaveLength(0);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

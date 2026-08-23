@@ -6831,6 +6831,22 @@ async function claimSuccessfulRunDelegatedChildDispositionInTransaction(
   if (!updated || updated.status !== "blocked") {
     return { kind: "covered" as const, reason: "source issue changed while creating delegated-child wait" };
   }
+  const autoCreatedChildBlockerRelations = autoCreatedChildBlockerIds.length > 0
+    ? await txDb
+      .select({ id: issueRelations.id, childIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, current.companyId),
+          eq(issueRelations.relatedIssueId, current.id),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.issueId, autoCreatedChildBlockerIds),
+        ),
+      )
+    : [];
+  const autoCreatedChildBlockerRelationIds = autoCreatedChildBlockerRelations
+    .map((relation) => relation.id)
+    .sort();
   await logActivity(txDb, {
     companyId: input.sourceIssue.companyId,
     actorType: "system",
@@ -6845,6 +6861,7 @@ async function claimSuccessfulRunDelegatedChildDispositionInTransaction(
       sourceRunId: input.run.id,
       childIssueIds: childIds,
       autoCreatedChildBlockerIds,
+      autoCreatedChildBlockerRelationIds,
       blockedByIssueIds,
       disposition: "blocked_on_healthy_delegated_children",
     },
@@ -9528,6 +9545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueIdentifier: sourceIssue.identifier,
       agentId: run.agentId,
       runId: run.id,
+      expectedSourceRunId: run.id,
       skipReason: resolution.kind === "converted"
         ? "healthy delegated child wait converted to blocker path"
         : resolution.reason,
@@ -9555,6 +9573,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
+    const expectedHandoffSourceRunId =
+      readNonEmptyString(context.sourceRunId) ??
+      readNonEmptyString(context.resumeFromRunId) ??
+      run.id;
 
     const issue = await db
       .select({
@@ -9780,6 +9802,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueIdentifier: issue.identifier,
         agentId: run.agentId,
         runId: run.id,
+        expectedSourceRunId: expectedHandoffSourceRunId,
         skipReason: decision.reason,
       });
     }
@@ -17379,6 +17402,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        if (deferredWakeReason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON) {
+          const sourceRunId = readNonEmptyString(deferredPayload.sourceRunId);
+          const sourceRun = sourceRunId
+            ? await tx
+              .select({
+                id: heartbeatRuns.id,
+                agentId: heartbeatRuns.agentId,
+                wakeupRequestId: heartbeatRuns.wakeupRequestId,
+                status: heartbeatRuns.status,
+                contextSnapshot: heartbeatRuns.contextSnapshot,
+              })
+              .from(heartbeatRuns)
+              .where(and(eq(heartbeatRuns.id, sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)))
+              .then((rows) => rows[0] ?? null)
+            : null;
+          const sourceRunContext = parseObject(sourceRun?.contextSnapshot);
+          const sourceRunIssueId =
+            readNonEmptyString(sourceRunContext.issueId) ?? readNonEmptyString(sourceRunContext.taskId);
+          if (
+            !sourceRun ||
+            sourceRun.status !== "succeeded" ||
+            sourceRun.agentId !== deferred.agentId ||
+            sourceRunIssueId !== issue.id
+          ) {
+            const now = new Date();
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "skipped",
+                reason: "successful_run_handoff_invalid_source",
+                payload: {
+                  ...deferredPayload,
+                  heartbeatSkip: {
+                    reason: "successful_run_handoff_invalid_source",
+                    sourceRunId,
+                    sourceRunStatus: sourceRun?.status ?? null,
+                    sourceRunIssueId,
+                  },
+                },
+                finishedAt: now,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+
+          let skipReason: string | null = null;
+          if (
+            issue.status !== "in_progress" ||
+            issue.assigneeAgentId !== sourceRun.agentId ||
+            issue.assigneeUserId
+          ) {
+            skipReason = "source issue changed before deferred corrective handoff promotion";
+          } else {
+            const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
+              issue,
+              excludeRunId: sourceRun.id,
+              // Do not let the deferred handoff prove its own continuation path.
+              excludeWakeupRequestId: deferred.id,
+            });
+            if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
+              skipReason = sourceState.durablePathReason
+                ? `concurrent durable path: ${sourceState.durablePathReason}`
+                : "concurrent execution path";
+            } else if ((await collectHealthyOpenChildIssues(tx as unknown as Db, issue)).length > 0) {
+              skipReason = "healthy delegated child path appeared before deferred corrective handoff promotion";
+            }
+          }
+
+          if (skipReason) {
+            await resolveRequiredSuccessfulRunHandoffOnValidPath(tx as unknown as Db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              issueIdentifier: issue.identifier,
+              agentId: sourceRun.agentId,
+              runId: run.id,
+              expectedSourceRunId: sourceRun.id,
+              skipReason,
+            });
+            const now = new Date();
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "skipped",
+                reason: "successful_run_handoff_superseded",
+                payload: {
+                  ...deferredPayload,
+                  heartbeatSkip: {
+                    reason: "successful_run_handoff_superseded",
+                    skipReason,
+                  },
+                },
+                finishedAt: now,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+        }
         // Local-CLI agents post comments under user auth, so a self-comment from
         // the run that is now ending would otherwise look like a real human
         // comment and trigger a reopen on the very issue this run just closed.
@@ -17928,6 +18050,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cancelledChildEdges = await tx
       .select({
+        relationId: issueRelations.id,
         childIssueId: issueRelations.issueId,
         childStatus: issues.status,
         childParentId: issues.parentId,
@@ -17964,20 +18087,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       )
       .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
-    const autoCreatedChildIds = new Set<string>();
+    const autoCreatedRelationIds = new Set<string>();
     for (const edge of cancelledChildEdges) {
       if (!edge.createdByAgentId || edge.childParentId !== input.parentIssueId || edge.childStatus !== "cancelled") {
         continue;
       }
       const autoCreated = markerRows.some((row) => {
-        const childIssueIds = parseObject(row.details).autoCreatedChildBlockerIds;
+        const relationIds = parseObject(row.details).autoCreatedChildBlockerRelationIds;
         return row.agentId === edge.createdByAgentId &&
-          Array.isArray(childIssueIds) &&
-          childIssueIds.includes(edge.childIssueId);
+          Array.isArray(relationIds) &&
+          relationIds.includes(edge.relationId);
       });
-      if (autoCreated) autoCreatedChildIds.add(edge.childIssueId);
+      if (autoCreated) autoCreatedRelationIds.add(edge.relationId);
     }
-    if (autoCreatedChildIds.size === 0) return false;
+    if (autoCreatedRelationIds.size === 0) return false;
 
     const removed = await tx
       .delete(issueRelations)
@@ -17985,15 +18108,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         and(
           eq(issueRelations.companyId, input.companyId),
           eq(issueRelations.type, "blocks"),
-          inArray(issueRelations.issueId, [...autoCreatedChildIds]),
+          inArray(issueRelations.id, [...autoCreatedRelationIds]),
           eq(issueRelations.relatedIssueId, input.parentIssueId),
         ),
       )
-      .returning({ id: issueRelations.id });
+      .returning({ id: issueRelations.id, childIssueId: issueRelations.issueId });
     if (removed.length === 0) return false;
 
-    for (const childIssueId of autoCreatedChildIds) {
-      const edge = cancelledChildEdges.find((candidate) => candidate.childIssueId === childIssueId)!;
+    for (const removedEdge of removed) {
+      const edge = cancelledChildEdges.find((candidate) => candidate.relationId === removedEdge.id)!;
       await logActivity(tx, {
         companyId: input.companyId,
         actorType: "system",
@@ -18004,7 +18127,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         entityType: "issue",
         entityId: input.parentIssueId,
         details: {
-          childIssueId,
+          childIssueId: removedEdge.childIssueId,
+          blockerRelationId: removedEdge.id,
           disposition: "cancelled_delegated_child_auto_blocker_removed",
           continuationReason: "issue_children_completed",
         },
@@ -18433,6 +18557,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           successfulHandoffSourceRun = sourceRun;
         }
 
+        const supersedeSuccessfulHandoffIfCovered = async () => {
+          if (reason !== FINISH_SUCCESSFUL_RUN_HANDOFF_REASON || !successfulHandoffSourceRun) {
+            return false;
+          }
+
+          let skipReason: string | null = null;
+          if (
+            issue.status !== "in_progress" ||
+            issue.assigneeAgentId !== successfulHandoffSourceRun.agentId ||
+            issue.assigneeUserId
+          ) {
+            skipReason = "source issue changed before corrective handoff enqueue";
+          } else {
+            const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
+              issue,
+              excludeRunId: successfulHandoffSourceRun.id,
+              excludeWakeupRequestId: successfulHandoffSourceRun.wakeupRequestId,
+            });
+            if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
+              skipReason = sourceState.durablePathReason
+                ? `concurrent durable path: ${sourceState.durablePathReason}`
+                : "concurrent execution path";
+            } else {
+              const healthyChildren = await collectHealthyOpenChildIssues(tx as unknown as Db, issue);
+              if (healthyChildren.length > 0) {
+                skipReason = "healthy delegated child path appeared before corrective handoff enqueue";
+              }
+            }
+          }
+
+          if (!skipReason) return false;
+
+          await resolveRequiredSuccessfulRunHandoffOnValidPath(tx as unknown as Db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            agentId: successfulHandoffSourceRun.agentId,
+            runId: successfulHandoffSourceRun.id,
+            expectedSourceRunId: successfulHandoffSourceRun.id,
+            skipReason,
+          });
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "successful_run_handoff_superseded",
+            payload: {
+              ...(payload ?? {}),
+              heartbeatSkip: {
+                reason: "successful_run_handoff_superseded",
+                skipReason,
+              },
+            },
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return true;
+        };
+
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
           if (
@@ -18640,6 +18827,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .where(eq(issues.id, issue.id));
             }
           }
+        }
+
+        // The handoff must never be merged into a run whose adapter has already
+        // copied its context. Revalidate after stale execution holders have been
+        // normalized, but before any coalesce/defer return can consume the wake.
+        if (await supersedeSuccessfulHandoffIfCovered()) {
+          return { kind: "skipped" as const };
         }
 
         await releaseCancelledDelegatedChildAutoBlocker(tx as unknown as Db, {
@@ -19096,62 +19290,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Revalidate at the last transactional point before inserting the
         // corrective wake. The earlier handoff decision was computed outside
         // this issue-row lock and may already be obsolete.
-        if (reason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON && successfulHandoffSourceRun) {
-          let skipReason: string | null = null;
-          if (
-            issue.status !== "in_progress" ||
-            issue.assigneeAgentId !== successfulHandoffSourceRun.agentId ||
-            issue.assigneeUserId
-          ) {
-            skipReason = "source issue changed before corrective handoff enqueue";
-          } else {
-            const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
-              issue,
-              excludeRunId: successfulHandoffSourceRun.id,
-              excludeWakeupRequestId: successfulHandoffSourceRun.wakeupRequestId,
-            });
-            if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
-              skipReason = sourceState.durablePathReason
-                ? `concurrent durable path: ${sourceState.durablePathReason}`
-                : "concurrent execution path";
-            } else {
-              const healthyChildren = await collectHealthyOpenChildIssues(tx as unknown as Db, issue);
-              if (healthyChildren.length > 0) {
-                skipReason = "healthy delegated child path appeared before corrective handoff enqueue";
-              }
-            }
-          }
-
-          if (skipReason) {
-            await resolveRequiredSuccessfulRunHandoffOnValidPath(tx as unknown as Db, {
-              companyId: issue.companyId,
-              issueId: issue.id,
-              issueIdentifier: issue.identifier,
-              agentId: successfulHandoffSourceRun.agentId,
-              runId: successfulHandoffSourceRun.id,
-              skipReason,
-            });
-            await tx.insert(agentWakeupRequests).values({
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "successful_run_handoff_superseded",
-              payload: {
-                ...(payload ?? {}),
-                heartbeatSkip: {
-                  reason: "successful_run_handoff_superseded",
-                  skipReason,
-                },
-              },
-              status: "skipped",
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-              finishedAt: new Date(),
-            });
-            return { kind: "skipped" as const };
-          }
+        if (await supersedeSuccessfulHandoffIfCovered()) {
+          return { kind: "skipped" as const };
         }
 
         const wakeupRequest = await tx

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
@@ -425,20 +425,28 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
       createdAt: new Date("2026-07-01T00:00:00.000Z"),
     });
 
-    await expect(resolveRequiredSuccessfulRunHandoffOnValidPath(db, {
+    const resolveInput = {
       companyId,
       issueId,
       issueIdentifier: "PAP-1",
       agentId,
       runId: resolverRunId,
+      expectedSourceRunId: sourceRunId,
       skipReason: "persisted issue monitor owns the next action",
-    })).resolves.toBe(true);
+    };
+    const concurrentResults = await Promise.all([
+      resolveRequiredSuccessfulRunHandoffOnValidPath(db, resolveInput),
+      resolveRequiredSuccessfulRunHandoffOnValidPath(db, resolveInput),
+    ]);
+    expect(concurrentResults.sort()).toEqual([false, true]);
 
-    const resolved = await db
+    const resolvedRows = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
-      .then((rows) => rows.find((row) => row.action === "issue.successful_run_handoff_resolved"));
+      .then((rows) => rows.filter((row) => row.action === "issue.successful_run_handoff_resolved"));
+    expect(resolvedRows).toHaveLength(1);
+    const resolved = resolvedRows[0];
     expect(resolved).toMatchObject({
       runId: resolverRunId,
       details: {
@@ -447,6 +455,28 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
         resolvedBySkipReason: "persisted issue monitor owns the next action",
       },
     });
+
+    const newerSourceRunId = randomUUID();
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      agentId,
+      details: { sourceRunId: newerSourceRunId },
+      createdAt: new Date("2030-08-01T00:00:00.000Z"),
+    });
+    await expect(resolveRequiredSuccessfulRunHandoffOnValidPath(db, resolveInput)).resolves.toBe(false);
+    const resolvedAfterNewerRequired = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_handoff_resolved"),
+      ));
+    expect(resolvedAfterNewerRequired).toHaveLength(1);
   });
 
   it("returns 304 for unchanged compact issue list ETags", async () => {

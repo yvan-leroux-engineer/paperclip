@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issues } from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
 import { logActivity } from "./activity-log.js";
 
@@ -80,49 +80,62 @@ export async function resolveRequiredSuccessfulRunHandoffOnValidPath(
     issueIdentifier: string | null;
     agentId: string;
     runId: string;
+    expectedSourceRunId: string;
     skipReason: string;
   },
 ) {
-  const latestHandoff = await db
-    .select({ action: activityLog.action, runId: activityLog.runId, details: activityLog.details })
-    .from(activityLog)
-    .where(and(
-      eq(activityLog.companyId, input.companyId),
-      eq(activityLog.entityType, "issue"),
-      eq(activityLog.entityId, input.issueId),
-      inArray(activityLog.action, [
-        "issue.successful_run_handoff_required",
-        "issue.successful_run_handoff_resolved",
-        "issue.successful_run_handoff_escalated",
-      ]),
-    ))
-    .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (latestHandoff?.action !== "issue.successful_run_handoff_required") return false;
+  return db.transaction(async (tx) => {
+    const lockedIssue = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!lockedIssue) return false;
 
-  const details = latestHandoff.details && typeof latestHandoff.details === "object"
-    ? latestHandoff.details as Record<string, unknown>
-    : {};
-  const sourceRunId = [details.sourceRunId, details.source_run_id, details.resumeFromRunId]
-    .find((value): value is string => typeof value === "string" && value.trim().length > 0)
-    ?.trim() ?? latestHandoff.runId;
-  await logActivity(db, {
-    companyId: input.companyId,
-    actorType: "system",
-    actorId: "heartbeat",
-    agentId: input.agentId,
-    runId: input.runId,
-    action: "issue.successful_run_handoff_resolved",
-    entityType: "issue",
-    entityId: input.issueId,
-    details: {
-      label: "Successful run handoff continuation confirmed",
-      sourceRunId,
-      resolvedByRunId: input.runId,
-      resolvedBySkipReason: input.skipReason,
-      issue: { id: input.issueId, identifier: input.issueIdentifier },
-    },
+    const latestHandoff = await tx
+      .select({ action: activityLog.action, runId: activityLog.runId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        inArray(activityLog.action, [
+          "issue.successful_run_handoff_required",
+          "issue.successful_run_handoff_resolved",
+          "issue.successful_run_handoff_escalated",
+        ]),
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (latestHandoff?.action !== "issue.successful_run_handoff_required") return false;
+
+    const details = latestHandoff.details && typeof latestHandoff.details === "object"
+      ? latestHandoff.details as Record<string, unknown>
+      : {};
+    const sourceRunId = [details.sourceRunId, details.source_run_id, details.resumeFromRunId]
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+      ?.trim() ?? latestHandoff.runId;
+    if (sourceRunId !== input.expectedSourceRunId) return false;
+
+    await logActivity(tx as unknown as Db, {
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.successful_run_handoff_resolved",
+      entityType: "issue",
+      entityId: input.issueId,
+      details: {
+        label: "Successful run handoff continuation confirmed",
+        sourceRunId,
+        resolvedByRunId: input.runId,
+        resolvedBySkipReason: input.skipReason,
+        issue: { id: input.issueId, identifier: input.issueIdentifier },
+      },
+    });
+    return true;
   });
-  return true;
 }
