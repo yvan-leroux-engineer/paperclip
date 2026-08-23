@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companySkillVersions,
   companySkills,
   createDb,
   heartbeatRunEvents,
@@ -55,7 +56,7 @@ if (!embeddedPostgresSupport.supported) {
 // The migration is read rather than restated so this test cannot drift away
 // from what actually runs against an existing database.
 const MIGRATION_STEPS = readFileSync(
-  new URL("../../../packages/db/src/migrations/0196_agent_wakeup_idempotency_key_unique.sql", import.meta.url),
+  new URL("../../../packages/db/src/migrations/0228_agent_wakeup_idempotency_key_unique.sql", import.meta.url),
   "utf8",
 )
   .split("--> statement-breakpoint")
@@ -130,6 +131,21 @@ describeEmbeddedPostgres("agent wakeup idempotency keys", () => {
   }, 30_000);
 
   afterEach(async () => {
+    // `wakeup()` returns once the run is queued. The execution task can still
+    // be entering the live-run registry, so wait for stable terminal states
+    // before deleting the seeded company.
+    let idlePolls = 0;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
+      if (!hasActiveRun) {
+        idlePolls += 1;
+        if (idlePolls >= 3) break;
+      } else {
+        idlePolls = 0;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const runIds = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -143,6 +159,7 @@ describeEmbeddedPostgres("agent wakeup idempotency keys", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(companies);
   });
