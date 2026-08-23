@@ -11,7 +11,9 @@
 import { createSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const APP_ID = '3718661';
+// Fork-specific Commitperclip GitHub App. Its private key is kept exclusively
+// in the repository Actions secret `COMMITPERCLIP_KEY`.
+const APP_ID = '4691422';
 const OWNER_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 const REPO_PATTERN = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
 
