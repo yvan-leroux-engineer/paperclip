@@ -248,7 +248,10 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
-import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
+import {
+  collectDispositionRepairSourceState,
+  collectHealthyOpenChildIssues,
+} from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -338,6 +341,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+const SUCCESSFUL_RUN_DELEGATED_WAIT_CREATED_ACTION = "issue.successful_run_delegated_wait_created";
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -6878,6 +6882,106 @@ export async function finalizeRunningRunWithTaskSession(
   return { run: current, updated: false as const };
 }
 
+type SuccessfulRunDelegatedChildDispositionInput = {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId" | "wakeupRequestId">;
+  sourceIssue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "identifier">;
+};
+
+async function claimSuccessfulRunDelegatedChildDispositionInTransaction(
+  txDb: Db,
+  input: SuccessfulRunDelegatedChildDispositionInput,
+  issuesSvc: ReturnType<typeof issueService>,
+) {
+  const current = await txDb
+    .select()
+    .from(issues)
+    .where(and(eq(issues.id, input.sourceIssue.id), eq(issues.companyId, input.sourceIssue.companyId)))
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  if (
+    !current ||
+    current.status !== "in_progress" ||
+    current.assigneeAgentId !== input.run.agentId ||
+    current.assigneeUserId
+  ) {
+    return { kind: "covered" as const, reason: "source issue changed before delegated-child disposition" };
+  }
+
+  const sourceState = await collectDispositionRepairSourceState(txDb, {
+    issue: current,
+    excludeRunId: input.run.id,
+    excludeWakeupRequestId: input.run.wakeupRequestId,
+  });
+  if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
+    return {
+      kind: "covered" as const,
+      reason: sourceState.durablePathReason
+        ? `concurrent durable path: ${sourceState.durablePathReason}`
+        : "concurrent execution path",
+    };
+  }
+
+  const healthyChildren = await collectHealthyOpenChildIssues(txDb, current);
+  if (healthyChildren.length === 0) return { kind: "allow_corrective" as const };
+
+  const existingBlockerIds = await txDb
+    .select({ id: issueRelations.issueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, current.companyId),
+        eq(issueRelations.relatedIssueId, current.id),
+        eq(issueRelations.type, "blocks"),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.id));
+  const childIds = healthyChildren.map((child) => child.id).sort();
+  const blockedByIssueIds = [...new Set([...existingBlockerIds, ...childIds])].sort();
+  const existingBlockerIdSet = new Set(existingBlockerIds);
+  const autoCreatedChildBlockerIds = childIds.filter((childId) => !existingBlockerIdSet.has(childId));
+  const updated = await issuesSvc.update(
+    current.id,
+    {
+      status: "blocked",
+      blockedByIssueIds,
+      actorAgentId: input.run.agentId,
+    },
+    txDb,
+  );
+  if (!updated || updated.status !== "blocked") {
+    return { kind: "covered" as const, reason: "source issue changed while creating delegated-child wait" };
+  }
+  await logActivity(txDb, {
+    companyId: input.sourceIssue.companyId,
+    actorType: "system",
+    actorId: "heartbeat",
+    agentId: input.run.agentId,
+    runId: input.run.id,
+    action: SUCCESSFUL_RUN_DELEGATED_WAIT_CREATED_ACTION,
+    entityType: "issue",
+    entityId: input.sourceIssue.id,
+    details: {
+      identifier: input.sourceIssue.identifier,
+      sourceRunId: input.run.id,
+      childIssueIds: childIds,
+      autoCreatedChildBlockerIds,
+      blockedByIssueIds,
+      disposition: "blocked_on_healthy_delegated_children",
+    },
+  });
+  return { kind: "converted" as const, childIds, blockedByIssueIds };
+}
+
+export async function claimSuccessfulRunDelegatedChildDisposition(
+  db: Db,
+  input: SuccessfulRunDelegatedChildDispositionInput,
+) {
+  const issuesSvc = issueService(db);
+  return db.transaction((tx) =>
+    claimSuccessfulRunDelegatedChildDispositionInTransaction(tx as unknown as Db, input, issuesSvc),
+  );
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -9512,6 +9616,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  async function resolveSuccessfulRunDelegatedChildDisposition(
+    run: typeof heartbeatRuns.$inferSelect,
+    sourceIssue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "identifier">,
+  ) {
+    const resolution = await claimSuccessfulRunDelegatedChildDisposition(db, { run, sourceIssue });
+    if (resolution.kind === "allow_corrective") return false;
+
+    await resolveRequiredSuccessfulRunHandoffOnValidPath(db, {
+      companyId: sourceIssue.companyId,
+      issueId: sourceIssue.id,
+      issueIdentifier: sourceIssue.identifier,
+      agentId: run.agentId,
+      runId: run.id,
+      skipReason: resolution.kind === "converted"
+        ? "healthy delegated child wait converted to blocker path"
+        : resolution.reason,
+    });
+
+    if (resolution.kind === "covered") return true;
+
+    // A child can finish between the health check and relation commit. The
+    // normal completion path sees relations created before it commits; this
+    // backstop covers the inverse ordering so the parent cannot remain blocked
+    // on an already-terminal child.
+    for (const childId of resolution.childIds) {
+      await recovery.reconcileResolvedDependencyWakeBackstop({
+        runId: run.id,
+        companyId: sourceIssue.companyId,
+        blockerIssueId: childId,
+        source: "workspace.finalize",
+      });
+    }
+    return true;
+  }
+
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
     if (run.status !== "succeeded") return;
     const context = parseObject(run.contextSnapshot);
@@ -9747,6 +9886,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (decision.kind !== "enqueue" || !issue) return;
+
+    if (await resolveSuccessfulRunDelegatedChildDisposition(run, issue)) return;
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -17922,6 +18063,103 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function releaseCancelledDelegatedChildAutoBlocker(
+    tx: Db,
+    input: {
+      companyId: string;
+      parentIssueId: string;
+      wakeReason: string | null;
+    },
+  ) {
+    if (input.wakeReason !== "issue_children_completed") return false;
+
+    const cancelledChildEdges = await tx
+      .select({
+        childIssueId: issueRelations.issueId,
+        childStatus: issues.status,
+        childParentId: issues.parentId,
+        createdByAgentId: issueRelations.createdByAgentId,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueRelations.issueId),
+          eq(issues.companyId, issueRelations.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueRelations.companyId, input.companyId),
+          eq(issueRelations.type, "blocks"),
+          eq(issueRelations.relatedIssueId, input.parentIssueId),
+          eq(issues.status, "cancelled"),
+          eq(issues.parentId, input.parentIssueId),
+        ),
+      );
+    if (cancelledChildEdges.length === 0) return false;
+
+    const markerRows = await tx
+      .select({ agentId: activityLog.agentId, details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.parentIssueId),
+          eq(activityLog.action, SUCCESSFUL_RUN_DELEGATED_WAIT_CREATED_ACTION),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
+    const autoCreatedChildIds = new Set<string>();
+    for (const edge of cancelledChildEdges) {
+      if (!edge.createdByAgentId || edge.childParentId !== input.parentIssueId || edge.childStatus !== "cancelled") {
+        continue;
+      }
+      const autoCreated = markerRows.some((row) => {
+        const childIssueIds = parseObject(row.details).autoCreatedChildBlockerIds;
+        return row.agentId === edge.createdByAgentId &&
+          Array.isArray(childIssueIds) &&
+          childIssueIds.includes(edge.childIssueId);
+      });
+      if (autoCreated) autoCreatedChildIds.add(edge.childIssueId);
+    }
+    if (autoCreatedChildIds.size === 0) return false;
+
+    const removed = await tx
+      .delete(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, input.companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.issueId, [...autoCreatedChildIds]),
+          eq(issueRelations.relatedIssueId, input.parentIssueId),
+        ),
+      )
+      .returning({ id: issueRelations.id });
+    if (removed.length === 0) return false;
+
+    for (const childIssueId of autoCreatedChildIds) {
+      const edge = cancelledChildEdges.find((candidate) => candidate.childIssueId === childIssueId)!;
+      await logActivity(tx, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: edge.createdByAgentId,
+        runId: null,
+        action: "issue.successful_run_delegated_cancelled_child_released",
+        entityType: "issue",
+        entityId: input.parentIssueId,
+        details: {
+          childIssueId,
+          disposition: "cancelled_delegated_child_auto_blocker_removed",
+          continuationReason: "issue_children_completed",
+        },
+      });
+    }
+    return true;
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -18258,6 +18496,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionWorkspacePreference: issues.executionWorkspacePreference,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
             assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+            executionPolicy: issues.executionPolicy,
+            executionState: issues.executionState,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
             createdAt: issues.createdAt,
@@ -18305,6 +18547,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
+        }
+
+        let successfulHandoffSourceRun: Pick<
+          typeof heartbeatRuns.$inferSelect,
+          "id" | "agentId" | "wakeupRequestId" | "status" | "contextSnapshot"
+        > | null = null;
+        if (reason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON) {
+          const sourceRunId = readNonEmptyString(payload?.sourceRunId);
+          const sourceRun = sourceRunId
+            ? await tx
+              .select({
+                id: heartbeatRuns.id,
+                agentId: heartbeatRuns.agentId,
+                wakeupRequestId: heartbeatRuns.wakeupRequestId,
+                status: heartbeatRuns.status,
+                contextSnapshot: heartbeatRuns.contextSnapshot,
+              })
+              .from(heartbeatRuns)
+              .where(and(eq(heartbeatRuns.id, sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)))
+              .then((rows) => rows[0] ?? null)
+            : null;
+          const sourceRunContext = parseObject(sourceRun?.contextSnapshot);
+          const sourceRunIssueId =
+            readNonEmptyString(sourceRunContext.issueId) ?? readNonEmptyString(sourceRunContext.taskId);
+          if (
+            !sourceRun ||
+            sourceRun.status !== "succeeded" ||
+            sourceRun.agentId !== agentId ||
+            sourceRunIssueId !== issue.id
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "successful_run_handoff_invalid_source",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  reason: "successful_run_handoff_invalid_source",
+                  sourceRunId,
+                  sourceRunStatus: sourceRun?.status ?? null,
+                  sourceRunIssueId,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+          successfulHandoffSourceRun = sourceRun;
         }
 
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
@@ -18515,6 +18811,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
         }
+
+        await releaseCancelledDelegatedChildAutoBlocker(tx as unknown as Db, {
+          companyId: issue.companyId,
+          parentIssueId: issue.id,
+          wakeReason: readNonEmptyString(enrichedContextSnapshot.wakeReason) ?? reason,
+        });
 
         const dependencyReadiness = await issuesSvc.listDependencyReadiness(
           issue.companyId,
@@ -18961,6 +19263,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .where(eq(agents.id, agentId));
           }
           return { kind: "skipped" as const };
+        }
+
+        // Revalidate at the last transactional point before inserting the
+        // corrective wake. The earlier handoff decision was computed outside
+        // this issue-row lock and may already be obsolete.
+        if (reason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON && successfulHandoffSourceRun) {
+          let skipReason: string | null = null;
+          if (
+            issue.status !== "in_progress" ||
+            issue.assigneeAgentId !== successfulHandoffSourceRun.agentId ||
+            issue.assigneeUserId
+          ) {
+            skipReason = "source issue changed before corrective handoff enqueue";
+          } else {
+            const sourceState = await collectDispositionRepairSourceState(tx as unknown as Db, {
+              issue,
+              excludeRunId: successfulHandoffSourceRun.id,
+              excludeWakeupRequestId: successfulHandoffSourceRun.wakeupRequestId,
+            });
+            if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
+              skipReason = sourceState.durablePathReason
+                ? `concurrent durable path: ${sourceState.durablePathReason}`
+                : "concurrent execution path";
+            } else {
+              const healthyChildren = await collectHealthyOpenChildIssues(tx as unknown as Db, issue);
+              if (healthyChildren.length > 0) {
+                skipReason = "healthy delegated child path appeared before corrective handoff enqueue";
+              }
+            }
+          }
+
+          if (skipReason) {
+            await resolveRequiredSuccessfulRunHandoffOnValidPath(tx as unknown as Db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              issueIdentifier: issue.identifier,
+              agentId: successfulHandoffSourceRun.agentId,
+              runId: successfulHandoffSourceRun.id,
+              skipReason,
+            });
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "successful_run_handoff_superseded",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  reason: "successful_run_handoff_superseded",
+                  skipReason,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
         }
 
         const wakeupRequest = await tx
