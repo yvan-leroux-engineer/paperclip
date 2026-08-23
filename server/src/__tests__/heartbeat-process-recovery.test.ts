@@ -1170,6 +1170,59 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
+  async function seedDelegatedChild(input: {
+    companyId: string;
+    parentId: string;
+    issueNumber: number;
+    status?: "todo" | "done";
+    withDeferredWake?: boolean;
+  }) {
+    const childIssueId = randomUUID();
+    const childAgentId = input.withDeferredWake ? randomUUID() : null;
+    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    if (childAgentId) {
+      await db.insert(agents).values({
+        id: childAgentId,
+        companyId: input.companyId,
+        name: "DelegatedWorker",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+    }
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId: input.companyId,
+      parentId: input.parentId,
+      title: input.status === "done" ? "Completed delegated follow-up" : "Delegated follow-up",
+      status: input.status ?? "todo",
+      priority: "medium",
+      assigneeAgentId: childAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: input.issueNumber,
+      identifier: `${issuePrefix}-${input.issueNumber}`,
+      completedAt: input.status === "done" ? new Date("2026-03-19T00:00:01.000Z") : null,
+    });
+    if (childAgentId) {
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId: input.companyId,
+        agentId: childAgentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: childIssueId, taskId: childIssueId },
+        status: "deferred_issue_execution",
+        requestedAt: new Date("2026-03-19T00:00:01.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:01.000Z"),
+      });
+    }
+    return childIssueId;
+  }
+
   it("persists the normalized failure when an adapter omits its diagnostic", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 1,
@@ -3725,6 +3778,124 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
+  });
+
+  it("turns a healthy delegated child into a dependency wait instead of a corrective model wake", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    let childIssueId: string | null = null;
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      childIssueId = await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        issueNumber: 2,
+        withDeferredWake: true,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Delegated the implementation to the child issue.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Delegated the implementation to the child issue.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+    expect(childIssueId).toBeTypeOf("string");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([childIssueId]);
+
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+        ),
+      );
+    expect(handoffWakeups).toHaveLength(0);
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity).toContainEqual(expect.objectContaining({
+      action: "issue.successful_run_delegated_wait_created",
+      runId,
+    }));
+  });
+
+  it("keeps the corrective wake when delegated children are terminal or have no live path", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        issueNumber: 2,
+      });
+      await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        status: "done",
+        issueNumber: 3,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Created a child but did not assign or schedule it.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Created a child but did not assign or schedule it.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const handoffWakeups = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      const matches = rows.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff");
+      return matches.length > 0 ? matches : null;
+    }, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    expect(handoffWakeups).toHaveLength(1);
+    const sourceIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

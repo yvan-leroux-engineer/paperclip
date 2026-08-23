@@ -88,6 +88,7 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
+  collectHealthyOpenChildIssues,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
@@ -2962,25 +2963,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect) {
-    const childCandidates = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, issue.companyId),
-          eq(issues.parentId, issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
-    const openChildren = [] as Array<{ id: string; identifier: string | null }>;
-    for (const child of childCandidates) {
-      const childState = await collectDispositionRepairSourceState(db, { issue: child });
-      if (childState.hasActiveExecutionPath || childState.hasDurableWaitingPath) {
-        openChildren.push({ id: child.id, identifier: child.identifier });
-      }
-    }
-    return openChildren;
+    return collectHealthyOpenChildIssues(db, issue);
   }
 
   async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {

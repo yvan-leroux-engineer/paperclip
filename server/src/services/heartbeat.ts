@@ -247,7 +247,10 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
-import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
+import {
+  collectDispositionRepairSourceState,
+  collectHealthyOpenChildIssues,
+} from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -9411,6 +9414,119 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  async function resolveSuccessfulRunDelegatedChildDisposition(
+    run: typeof heartbeatRuns.$inferSelect,
+    sourceIssue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "identifier">,
+  ) {
+    const resolution = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const current = await txDb
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, sourceIssue.id), eq(issues.companyId, sourceIssue.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !current ||
+        current.status !== "in_progress" ||
+        current.assigneeAgentId !== run.agentId ||
+        current.assigneeUserId
+      ) {
+        return null;
+      }
+
+      // Recheck the source under its row lock. A concurrent monitor, blocker,
+      // interaction, approval, wake, or run is already a valid disposition and
+      // must win over this fallback.
+      const sourceState = await collectDispositionRepairSourceState(txDb, {
+        issue: current,
+        excludeRunId: run.id,
+        excludeWakeupRequestId: run.wakeupRequestId,
+      });
+      if (sourceState.hasActiveExecutionPath || sourceState.hasDurableWaitingPath) {
+        return null;
+      }
+
+      const healthyChildren = await collectHealthyOpenChildIssues(txDb, current);
+      if (healthyChildren.length === 0) return null;
+
+      const existingBlockerIds = await txDb
+        .select({ id: issueRelations.issueId })
+        .from(issueRelations)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.id, issueRelations.issueId),
+            eq(issues.companyId, issueRelations.companyId),
+          ),
+        )
+        .where(
+          and(
+            eq(issueRelations.companyId, current.companyId),
+            eq(issueRelations.relatedIssueId, current.id),
+            eq(issueRelations.type, "blocks"),
+            notInArray(issues.status, ["done", "cancelled"]),
+            visibleIssueCondition(),
+          ),
+        )
+        .then((rows) => rows.map((row) => row.id));
+      const childIds = healthyChildren.map((child) => child.id).sort();
+      const blockedByIssueIds = [...new Set([...existingBlockerIds, ...childIds])].sort();
+      const updated = await issuesSvc.update(
+        current.id,
+        {
+          status: "blocked",
+          blockedByIssueIds,
+          actorAgentId: run.agentId,
+        },
+        txDb,
+      );
+      if (!updated || updated.status !== "blocked") return null;
+      return { childIds, blockedByIssueIds };
+    });
+    if (!resolution) return false;
+
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: run.agentId,
+      runId: run.id,
+      action: "issue.successful_run_delegated_wait_created",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details: {
+        identifier: sourceIssue.identifier,
+        sourceRunId: run.id,
+        childIssueIds: resolution.childIds,
+        blockedByIssueIds: resolution.blockedByIssueIds,
+        disposition: "blocked_on_healthy_delegated_children",
+      },
+    });
+    await resolveRequiredSuccessfulRunHandoffOnValidPath(db, {
+      companyId: sourceIssue.companyId,
+      issueId: sourceIssue.id,
+      issueIdentifier: sourceIssue.identifier,
+      agentId: run.agentId,
+      runId: run.id,
+      skipReason: "healthy delegated child wait converted to blocker path",
+    });
+
+    // A child can finish between the health check and relation commit. The
+    // normal completion path sees relations created before it commits; this
+    // backstop covers the inverse ordering so the parent cannot remain blocked
+    // on an already-terminal child.
+    for (const childId of resolution.childIds) {
+      await recovery.reconcileResolvedDependencyWakeBackstop({
+        runId: run.id,
+        companyId: sourceIssue.companyId,
+        blockerIssueId: childId,
+        source: "workspace.finalize",
+      });
+    }
+    return true;
+  }
+
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
     if (run.status !== "succeeded") return;
     const context = parseObject(run.contextSnapshot);
@@ -9646,6 +9762,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (decision.kind !== "enqueue" || !issue) return;
+
+    if (await resolveSuccessfulRunDelegatedChildDisposition(run, issue)) return;
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db

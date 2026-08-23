@@ -238,3 +238,37 @@ export async function collectDispositionRepairSourceState(
     durablePathReason,
   };
 }
+
+/**
+ * Return direct child issues that already have a live or durable path.
+ *
+ * A parent run can stop after delegating work to a child. In that case the
+ * child is a deterministic continuation path only when it is itself running,
+ * queued, monitored, blocked on a first-class dependency, or waiting on a
+ * typed interaction/approval. A merely open child is not enough: treating an
+ * inert todo as healthy would hide a genuinely stranded parent.
+ */
+export async function collectHealthyOpenChildIssues(
+  db: Db,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+) {
+  const candidates = await db
+    .select()
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, issue.companyId),
+        eq(issues.parentId, issue.id),
+        notInArray(issues.status, ["done", "cancelled"]),
+        sql`${issues.hiddenAt} is null`,
+      ),
+    );
+  const healthy: Array<typeof issues.$inferSelect> = [];
+  for (const child of candidates) {
+    const state = await collectDispositionRepairSourceState(db, { issue: child });
+    if (state.hasActiveExecutionPath || state.hasDurableWaitingPath) {
+      healthy.push(child);
+    }
+  }
+  return healthy;
+}
