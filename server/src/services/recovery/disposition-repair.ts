@@ -12,6 +12,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { visibleIssueCondition } from "../issue-visibility.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -169,7 +170,10 @@ export async function collectDispositionRepairSourceState(
           and(
             eq(heartbeatRuns.companyId, issue.companyId),
             inArray(heartbeatRuns.status, [...ACTIVE_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+            sql`coalesce(
+              ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+              ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+            ) = ${issue.id}`,
             input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : sql`true`,
           ),
         ),
@@ -179,8 +183,13 @@ export async function collectDispositionRepairSourceState(
         .where(
           and(
             eq(agentWakeupRequests.companyId, issue.companyId),
-            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+            sql`coalesce(
+              ${agentWakeupRequests.payload} ->> 'issueId',
+              ${agentWakeupRequests.payload} ->> 'taskId',
+              ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+              ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+            ) = ${issue.id}`,
             input.excludeWakeupRequestId
               ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId)
               : sql`true`,
@@ -260,7 +269,7 @@ export async function collectHealthyOpenChildIssues(
         eq(issues.companyId, issue.companyId),
         eq(issues.parentId, issue.id),
         notInArray(issues.status, ["done", "cancelled"]),
-        sql`${issues.hiddenAt} is null`,
+        visibleIssueCondition(),
       ),
     );
   const healthy: Array<typeof issues.$inferSelect> = [];

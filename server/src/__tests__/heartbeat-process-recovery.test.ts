@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, or, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -102,6 +102,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  claimSuccessfulRunDelegatedChildDisposition,
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
@@ -113,13 +114,17 @@ import {
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
+import { logActivity } from "../services/activity-log.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   noticeMetadataReferencesRecoveryAction,
 } from "../services/recovery/index.ts";
-import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
+import {
+  collectDispositionRepairSourceState,
+  collectHealthyOpenChildIssues,
+} from "../services/recovery/disposition-repair.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -1174,8 +1179,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     companyId: string;
     parentId: string;
     issueNumber: number;
-    status?: "todo" | "done";
+    status?: "todo" | "done" | "cancelled";
     withDeferredWake?: boolean;
+    harnessKind?: "skill_test";
+    wakeIssueEncoding?: "issueId" | "taskId" | "nestedTaskId";
   }) {
     const childIssueId = randomUUID();
     const childAgentId = input.withDeferredWake ? randomUUID() : null;
@@ -1199,14 +1206,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       parentId: input.parentId,
       title: input.status === "done" ? "Completed delegated follow-up" : "Delegated follow-up",
       status: input.status ?? "todo",
+      harnessKind: input.harnessKind ?? null,
       priority: "medium",
       assigneeAgentId: childAgentId,
       responsibleUserId: "responsible-user",
       issueNumber: input.issueNumber,
       identifier: `${issuePrefix}-${input.issueNumber}`,
       completedAt: input.status === "done" ? new Date("2026-03-19T00:00:01.000Z") : null,
+      cancelledAt: input.status === "cancelled" ? new Date("2026-03-19T00:00:01.000Z") : null,
     });
     if (childAgentId) {
+      const wakeIssueEncoding = input.wakeIssueEncoding ?? "issueId";
+      const payload = wakeIssueEncoding === "nestedTaskId"
+        ? { _paperclipWakeContext: { taskId: childIssueId } }
+        : wakeIssueEncoding === "taskId"
+          ? { taskId: childIssueId }
+          : { issueId: childIssueId };
       await db.insert(agentWakeupRequests).values({
         id: randomUUID(),
         companyId: input.companyId,
@@ -1214,7 +1229,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         source: "assignment",
         triggerDetail: "system",
         reason: "issue_assigned",
-        payload: { issueId: childIssueId, taskId: childIssueId },
+        payload,
         status: "deferred_issue_execution",
         requestedAt: new Date("2026-03-19T00:00:01.000Z"),
         updatedAt: new Date("2026-03-19T00:00:01.000Z"),
@@ -3896,6 +3911,273 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("in_progress");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
+  it("treats a re-entered or concurrently covered disposition as suppressing corrective work", async () => {
+    const { companyId, agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(issues)
+      .set({ status: "blocked", updatedAt: new Date("2026-03-19T00:00:01.000Z") })
+      .where(eq(issues.id, issueId));
+
+    const reentered = await claimSuccessfulRunDelegatedChildDisposition(db, {
+      run: { id: runId, agentId, wakeupRequestId },
+      sourceIssue: { id: issueId, companyId, identifier: null },
+    });
+    expect(reentered).toMatchObject({ kind: "covered" });
+
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        monitorNextCheckAt: null,
+        updatedAt: new Date("2026-03-19T00:00:02.000Z"),
+      })
+      .where(eq(issues.id, issueId));
+    const initiallyUncovered = await claimSuccessfulRunDelegatedChildDisposition(db, {
+      run: { id: runId, agentId, wakeupRequestId },
+      sourceIssue: { id: issueId, companyId, identifier: null },
+    });
+    expect(initiallyUncovered).toEqual({ kind: "allow_corrective" });
+
+    const lateHealthyChildId = await seedDelegatedChild({
+      companyId,
+      parentId: issueId,
+      issueNumber: 2,
+      withDeferredWake: true,
+    });
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      runId,
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      details: { sourceRunId: runId },
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+    const staleCorrectiveWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "finish_successful_run_handoff",
+      payload: { issueId, sourceRunId: runId },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "finish_successful_run_handoff",
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+    });
+    expect(staleCorrectiveWake).toBeNull();
+
+    const correctiveWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "finish_successful_run_handoff"));
+    expect(correctiveWakeups).toHaveLength(0);
+    const supersededWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "successful_run_handoff_superseded"));
+    expect(supersededWakeups).toHaveLength(1);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    const latestHandoffAction = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        inArray(activityLog.action, [
+          "issue.successful_run_handoff_required",
+          "issue.successful_run_handoff_resolved",
+        ]),
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    expect(latestHandoffAction?.action).toBe("issue.successful_run_handoff_resolved");
+    expect(lateHealthyChildId).toBeTypeOf("string");
+  });
+
+  it("recognizes canonical task wake encodings and ignores internal harness children", async () => {
+    const { companyId, issueId } = await seedQueuedIssueRunFixture();
+    const taskChildId = await seedDelegatedChild({
+      companyId,
+      parentId: issueId,
+      issueNumber: 2,
+      withDeferredWake: true,
+      wakeIssueEncoding: "taskId",
+    });
+    const nestedTaskChildId = await seedDelegatedChild({
+      companyId,
+      parentId: issueId,
+      issueNumber: 3,
+      withDeferredWake: true,
+      wakeIssueEncoding: "nestedTaskId",
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "claimed", updatedAt: new Date("2026-03-19T00:00:02.000Z") })
+      .where(sql`${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${nestedTaskChildId}`);
+    const harnessChildId = await seedDelegatedChild({
+      companyId,
+      parentId: issueId,
+      issueNumber: 4,
+      withDeferredWake: true,
+      harnessKind: "skill_test",
+    });
+
+    const healthy = await collectHealthyOpenChildIssues(db, { id: issueId, companyId });
+    const healthyIds = healthy.map((child) => child.id).sort();
+    expect(healthyIds).toEqual([nestedTaskChildId, taskChildId].sort());
+    expect(healthyIds).not.toContain(harnessChildId);
+  });
+
+  it("rejects corrective handoff wakes with a missing or non-succeeded source run", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+    const buildWake = (sourceRunId?: string) => ({
+      source: "automation" as const,
+      triggerDetail: "system" as const,
+      reason: "finish_successful_run_handoff",
+      payload: { issueId, ...(sourceRunId ? { sourceRunId } : {}) },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "finish_successful_run_handoff",
+      },
+      requestedByActorType: "system" as const,
+      requestedByActorId: "heartbeat",
+    });
+
+    await expect(heartbeat.wakeup(agentId, buildWake())).resolves.toBeNull();
+    await expect(heartbeat.wakeup(agentId, buildWake(runId))).resolves.toBeNull();
+
+    const invalidSourceWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "successful_run_handoff_invalid_source"));
+    expect(invalidSourceWakeups).toHaveLength(2);
+    const correctiveWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "finish_successful_run_handoff"));
+    expect(correctiveWakeups).toHaveLength(0);
+  });
+
+  it("removes every cancelled auto-child blocker when a later child completes and emits one continuation wake", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    let cancelledChildId: string | null = null;
+    let completedChildId: string | null = null;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      cancelledChildId = await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        issueNumber: 2,
+        withDeferredWake: true,
+      });
+      completedChildId = await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        issueNumber: 3,
+        withDeferredWake: true,
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Delegated both child tasks.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    expect(cancelledChildId).toBeTypeOf("string");
+    expect(completedChildId).toBeTypeOf("string");
+    await db
+      .update(issues)
+      .set({
+        status: "cancelled",
+        cancelledAt: new Date("2026-03-19T00:00:03.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:03.000Z"),
+      })
+      .where(eq(issues.id, cancelledChildId!));
+    await db
+      .update(issues)
+      .set({
+        status: "done",
+        completedAt: new Date("2026-03-19T00:00:04.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:04.000Z"),
+      })
+      .where(eq(issues.id, completedChildId!));
+
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db
+        .update(issues)
+        .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Reconciled the delegated child outcomes.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const continuationRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: {
+        issueId,
+        completedChildIssueId: completedChildId,
+        childIssueIds: [cancelledChildId, completedChildId],
+      },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_children_completed",
+        completedChildIssueId: completedChildId,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+    });
+    expect(continuationRun).not.toBeNull();
+    await waitForRunToSettle(heartbeat, continuationRun!.id, 5_000);
+    await heartbeat.waitForRunExecutionDrain(continuationRun!.id);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([completedChildId]);
+    const continuationWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "issue_children_completed"));
+    expect(continuationWakeups).toHaveLength(1);
+    const releaseActivities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.successful_run_delegated_cancelled_child_released"));
+    expect(releaseActivities).toContainEqual(expect.objectContaining({
+      entityId: issueId,
+      details: expect.objectContaining({ childIssueId: cancelledChildId }),
+    }));
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
