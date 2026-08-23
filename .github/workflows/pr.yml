@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - master
+      - laundry/patchset
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
