@@ -3857,6 +3857,188 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }));
   });
 
+  it("publishes the required handoff lineage before the corrective adapter starts", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    let requiredVisibleAtCorrectiveStart = false;
+    let correctiveStarted = false;
+    mockAdapterExecute
+      .mockImplementationOnce(async (ctx: { runId: string }) => {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Produced progress without recording a final disposition.",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Produced progress without recording a final disposition.",
+          provider: "test",
+          model: "test-model",
+        };
+      })
+      .mockImplementationOnce(async () => {
+        correctiveStarted = true;
+        requiredVisibleAtCorrectiveStart = await db
+          .select({ details: activityLog.details })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.successful_run_handoff_required"),
+          ))
+          .then((rows) => rows.some((row) =>
+            row.details &&
+            typeof row.details === "object" &&
+            (row.details as Record<string, unknown>).sourceRunId === runId
+          ));
+        await db
+          .update(issues)
+          .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
+          .where(eq(issues.id, issueId));
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Recorded the final disposition.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => correctiveStarted ? true : null, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    expect(correctiveStarted).toBe(true);
+    expect(requiredVisibleAtCorrectiveStart).toBe(true);
+    await waitForValue(async () => db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_handoff_resolved"),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null), 5_000);
+    const handoffActions = await db
+      .select({ action: activityLog.action, details: activityLog.details, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        inArray(activityLog.action, [
+          "issue.successful_run_handoff_required",
+          "issue.successful_run_handoff_resolved",
+        ]),
+      ))
+      .orderBy(activityLog.createdAt, activityLog.id);
+    expect(handoffActions.map((row) => row.action)).toEqual([
+      "issue.successful_run_handoff_required",
+      "issue.successful_run_handoff_resolved",
+    ]);
+    expect(handoffActions[1]?.details).toMatchObject({ sourceRunId: runId });
+    const requiredComment = await db
+      .select({ createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        eq(issueComments.createdByRunId, runId),
+        eq(issueComments.body, SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (requiredComment) {
+      expect(requiredComment.createdAt.getTime()).toBeLessThanOrEqual(
+        handoffActions[1]!.createdAt.getTime(),
+      );
+    }
+  });
+
+  it("lets a corrective run resolve its source lineage with a healthy delegated child", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId, taskId: issueId },
+      finishedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          handoffRequired: true,
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      runId: sourceRunId,
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      details: { sourceRunId, correctiveRunId: runId },
+    });
+
+    let childIssueId: string | null = null;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      childIssueId = await seedDelegatedChild({
+        companyId,
+        parentId: issueId,
+        issueNumber: 2,
+        withDeferredWake: true,
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Delegated the corrective work to a healthy child.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([childIssueId]);
+    const sourceIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+    const resolved = await db
+      .select({ runId: activityLog.runId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_handoff_resolved"),
+      ));
+    expect(resolved).toContainEqual(expect.objectContaining({
+      runId,
+      details: expect.objectContaining({ sourceRunId, resolvedByRunId: runId }),
+    }));
+  });
+
   it("keeps the corrective wake when delegated children are terminal or have no live path", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {

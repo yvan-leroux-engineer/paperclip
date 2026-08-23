@@ -9505,36 +9505,74 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: Pick<typeof agents.$inferSelect, "id" | "name">;
     detectedProgressSummary: string;
   }) {
-    const existing = await db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, input.run.companyId),
-          eq(issueComments.issueId, input.issue.id),
-          eq(issueComments.createdByRunId, input.run.id),
-          sql`(${issueComments.body} = ${SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY} or ${issueComments.body} like '## This issue still needs a next step%' or ${issueComments.body} like '## Successful run missing issue disposition%')`,
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (existing) return null;
-    const notice = buildSuccessfulRunHandoffRequiredNotice(input);
-    return issuesSvc.addComment(
-      input.issue.id,
-      notice.body,
-      { runId: input.run.id },
-      {
-        authorType: "system",
-        presentation: notice.presentation,
-        metadata: notice.metadata,
-      },
-    );
+    return db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.run.companyId)))
+        .for("update");
+      const latestHandoff = await tx
+        .select({ action: activityLog.action, runId: activityLog.runId, details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, input.run.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issue.id),
+          inArray(activityLog.action, [
+            "issue.successful_run_handoff_required",
+            "issue.successful_run_handoff_resolved",
+            "issue.successful_run_handoff_escalated",
+          ]),
+        ))
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const latestDetails = parseObject(latestHandoff?.details);
+      const latestSourceRunId =
+        readNonEmptyString(latestDetails.sourceRunId) ??
+        readNonEmptyString(latestDetails.source_run_id) ??
+        readNonEmptyString(latestDetails.resumeFromRunId) ??
+        latestHandoff?.runId;
+      if (
+        latestHandoff?.action !== "issue.successful_run_handoff_required" ||
+        latestSourceRunId !== input.run.id
+      ) {
+        return null;
+      }
+
+      const existing = await tx
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, input.run.companyId),
+            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.createdByRunId, input.run.id),
+            sql`(${issueComments.body} = ${SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY} or ${issueComments.body} like '## This issue still needs a next step%' or ${issueComments.body} like '## Successful run missing issue disposition%')`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existing) return null;
+      const notice = buildSuccessfulRunHandoffRequiredNotice(input);
+      return issuesSvc.addComment(
+        input.issue.id,
+        notice.body,
+        { runId: input.run.id },
+        {
+          authorType: "system",
+          presentation: notice.presentation,
+          metadata: notice.metadata,
+        },
+        tx,
+      );
+    });
   }
 
   async function resolveSuccessfulRunDelegatedChildDisposition(
     run: typeof heartbeatRuns.$inferSelect,
     sourceIssue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "identifier">,
+    expectedSourceRunId: string,
   ) {
     const resolution = await claimSuccessfulRunDelegatedChildDisposition(db, { run, sourceIssue });
     if (resolution.kind === "allow_corrective") return false;
@@ -9545,7 +9583,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueIdentifier: sourceIssue.identifier,
       agentId: run.agentId,
       runId: run.id,
-      expectedSourceRunId: run.id,
+      expectedSourceRunId,
       skipReason: resolution.kind === "converted"
         ? "healthy delegated child wait converted to blocker path"
         : resolution.reason,
@@ -9577,6 +9615,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       readNonEmptyString(context.sourceRunId) ??
       readNonEmptyString(context.resumeFromRunId) ??
       run.id;
+    const isCorrectiveHandoffRun =
+      context.handoffRequired === true ||
+      readNonEmptyString(context.wakeReason) === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON;
 
     const issue = await db
       .select({
@@ -9795,6 +9836,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       idempotentWakeExists: Boolean(existingWake),
     });
 
+    // A corrective handoff run owns the original source run's required marker.
+    // If it establishes a real disposition (including a healthy delegated-child
+    // path), resolve that exact lineage instead of leaving the source marker
+    // stranded merely because corrective runs do not enqueue another handoff.
+    if (
+      isCorrectiveHandoffRun &&
+      issue &&
+      await resolveSuccessfulRunDelegatedChildDisposition(
+        run,
+        issue,
+        expectedHandoffSourceRunId,
+      )
+    ) {
+      return;
+    }
+
     if (isSuccessfulRunHandoffValidPathSkip(decision) && issue) {
       await resolveRequiredSuccessfulRunHandoffOnValidPath(db, {
         companyId: issue.companyId,
@@ -9809,7 +9866,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (decision.kind !== "enqueue" || !issue) return;
 
-    if (await resolveSuccessfulRunDelegatedChildDisposition(run, issue)) return;
+    if (await resolveSuccessfulRunDelegatedChildDisposition(run, issue, run.id)) return;
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -9839,25 +9896,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       run,
       agent,
       detectedProgressSummary: detectedProgressSummary ?? "The run reported progress, but did not choose a next step.",
-    });
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: "system",
-      actorId: "heartbeat",
-      agentId: run.agentId,
-      runId: run.id,
-      action: "issue.successful_run_handoff_required",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        label: "Successful run missing issue disposition",
-        sourceRunId: run.id,
-        correctiveRunId: handoffRun.id,
-        handoffReason: SUCCESSFUL_RUN_MISSING_STATE_REASON,
-        missingDisposition: "clear_next_step",
-        detectedProgressSummary,
-        issue: issueUiLink(issue),
-      },
     });
   }
 
@@ -19335,6 +19373,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: new Date(),
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+        if (reason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON && successfulHandoffSourceRun) {
+          // Publish the required lineage in the same issue-locked transaction as
+          // its corrective run. The adapter can start immediately after this
+          // transaction commits, so writing this marker in the caller would let
+          // a fast corrective run finish before the marker existed.
+          await logActivity(tx as unknown as Db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "heartbeat",
+            agentId: successfulHandoffSourceRun.agentId,
+            runId: successfulHandoffSourceRun.id,
+            action: "issue.successful_run_handoff_required",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              label: "Successful run missing issue disposition",
+              sourceRunId: successfulHandoffSourceRun.id,
+              correctiveRunId: newRun.id,
+              handoffReason:
+                readNonEmptyString(payload?.handoffReason) ?? SUCCESSFUL_RUN_MISSING_STATE_REASON,
+              missingDisposition: readNonEmptyString(payload?.missingDisposition) ?? "clear_next_step",
+              detectedProgressSummary: readNonEmptyString(payload?.detectedProgressSummary),
+              issue: issueUiLink(issue),
+            },
+          });
+        }
 
         // executionRunId is NOT stamped here (enqueueWakeup queues the run but
         // doesn't start it). It will be stamped in claimQueuedRun() once the run
