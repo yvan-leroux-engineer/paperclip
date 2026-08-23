@@ -75,9 +75,17 @@ import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.j
 import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import {
-  IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES,
-  isIssueChildrenCompletedWakeStateKey,
+  ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
 } from "./issue-child-completion-wakeups.js";
+import {
+  IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES,
+  IN_FLIGHT_ISSUE_WAKE_STATUSES,
+  ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY,
+  ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY,
+  isIssueWakeStateKey,
+  mergeIssueWakeStateKeys,
+  writeIssueWakeStateKeys,
+} from "./issue-wakeup-state-keys.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -801,6 +809,7 @@ function mergeAdapterRecoveryMetadata(input: {
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
   "issue_recovery_action_restored",
 ]);
 const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
@@ -17323,6 +17332,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (readNonEmptyString(deferred.triggerDetail) as WakeupOptions["triggerDetail"]) ?? null;
         const promotedPayload = deferredPayload;
         delete promotedPayload[DEFERRED_WAKE_CONTEXT_KEY];
+        delete promotedPayload[ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY];
+        delete promotedPayload[ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY];
 
         const {
           contextSnapshot: promotedContextSnapshot,
@@ -18117,33 +18128,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
-        // The issue row lock serializes all wakes for this parent. An exact
-        // child-terminal-state key can therefore be checked and consumed in
+        // The issue row lock serializes all wakes for this issue. An exact
+        // level-triggered state key can therefore be checked and consumed in
         // the same transaction without a schema migration or a TOCTOU window.
         // Failed, cancelled, and skipped requests remain retryable.
-        if (isIssueChildrenCompletedWakeStateKey(opts.idempotencyKey)) {
-          const existingChildCompletionWake = await tx
+        if (isIssueWakeStateKey(opts.idempotencyKey)) {
+          const existingStateWake = await tx
             .select({ id: agentWakeupRequests.id })
             .from(agentWakeupRequests)
             .where(and(
               eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId),
-              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
-              inArray(
-                agentWakeupRequests.status,
-                [...IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES],
+              or(
+                and(
+                  or(
+                    eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+                    and(
+                      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+                      sql`jsonb_typeof(${agentWakeupRequests.payload} -> ${ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY}) = 'array'`,
+                      sql`${agentWakeupRequests.payload} -> ${ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY} ? ${opts.idempotencyKey}`,
+                    ),
+                  ),
+                  inArray(
+                    agentWakeupRequests.status,
+                    [...IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES],
+                  ),
+                ),
+                and(
+                  sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+                  sql`${agentWakeupRequests.payload} ->> ${ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY} = 'true'`,
+                  inArray(agentWakeupRequests.status, [...IN_FLIGHT_ISSUE_WAKE_STATUSES]),
+                ),
               ),
             ))
             .limit(1)
             .then((rows) => rows[0] ?? null);
 
-          if (existingChildCompletionWake) {
+          if (existingStateWake) {
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
               agentId,
               source,
               triggerDetail,
-              reason: "issue_children_completed_duplicate_state",
+              reason: opts.reason === "issue_blockers_resolved"
+                ? "issue_blockers_resolved_duplicate_state"
+                : "issue_children_completed_duplicate_state",
               payload,
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
@@ -18595,35 +18624,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
               })
-              .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
+              // A state-key wake is consumed by coalescing only if the target
+              // run has not started. This CAS closes the queued -> running
+              // race: if the executor claimed the row first, fall through to
+              // the deferred path so the state is delivered in a new run.
+              .where(
+                isIssueWakeStateKey(opts.idempotencyKey)
+                  ? and(
+                      eq(heartbeatRuns.id, availableActiveExecutionRun.id),
+                      inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                    )
+                  : eq(heartbeatRuns.id, availableActiveExecutionRun.id),
+              )
               .returning()
-              .then((rows) => rows[0] ?? availableActiveExecutionRun);
+              .then((rows) => rows[0] ?? null);
 
-            await tx.insert(agentWakeupRequests).values({
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "issue_execution_same_name",
-              payload,
-              status: "coalesced",
-              coalescedCount: 1,
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-              runId: mergedRun.id,
-              finishedAt: new Date(),
-            });
+            if (mergedRun) {
+              await tx.insert(agentWakeupRequests).values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_execution_same_name",
+                payload,
+                status: "coalesced",
+                coalescedCount: 1,
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                runId: mergedRun.id,
+                finishedAt: new Date(),
+              });
 
-            return { kind: "coalesced" as const, run: mergedRun };
+              return { kind: "coalesced" as const, run: mergedRun };
+            }
           }
 
           if (availableActiveExecutionRun) {
-            const deferredPayload = {
+            const deferredStateKeys = mergeIssueWakeStateKeys(
+              payload ?? {},
+              opts.idempotencyKey,
+            );
+            const deferredPayload = writeIssueWakeStateKeys({
               ...(payload ?? {}),
               issueId,
               [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
-            };
+            }, deferredStateKeys);
 
             const existingDeferred = await tx
               .select()
@@ -18647,17 +18693,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 existingDeferredContext,
                 enrichedContextSnapshot,
               );
-              const mergedDeferredPayload = {
+              const mergedDeferredPayload: Record<string, unknown> = {
                 ...existingDeferredPayload,
                 ...(payload ?? {}),
                 issueId,
                 [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
               };
+              const mergedStateKeys = mergeIssueWakeStateKeys(
+                existingDeferredPayload,
+                payload ?? {},
+                existingDeferred.idempotencyKey,
+                opts.idempotencyKey,
+              );
+              const boundedMergedDeferredPayload = writeIssueWakeStateKeys(
+                mergedDeferredPayload,
+                mergedStateKeys,
+              );
 
               await tx
                 .update(agentWakeupRequests)
                 .set({
-                  payload: mergedDeferredPayload,
+                  payload: boundedMergedDeferredPayload,
                   coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
                   updatedAt: new Date(),
                 })

@@ -2,6 +2,9 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { buildIssueChildrenCompletedWakeStateKey } from "../services/issue-child-completion-wakeups.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
+import { ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY } from "../services/issue-wakeup-state-keys.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -2718,6 +2721,123 @@ describe.sequential("issue comment reopen routes", () => {
           }),
         }),
       );
+    });
+  });
+
+  it("preserves both state identities when comment approval completes a child that blocks its parent", async () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const parentAgentId = "44444444-4444-4444-8444-444444444444";
+    const parentIssueId = "55555555-5555-4555-8555-555555555555";
+    const childUpdatedAt = new Date("2026-08-22T12:05:00.000Z");
+    const policy = await normalizePolicy({
+      stages: [{
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      parentId: parentIssueId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const childStateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId,
+      children: [{ id: issue.id, status: "done", updatedAt: childUpdatedAt }],
+    });
+    const blockerStateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: parentIssueId,
+      blockerIssueIds: [issue.id],
+    });
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-review-parent-blocker",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: reviewBody,
+      createdAt: childUpdatedAt,
+      updatedAt: childUpdatedAt,
+      authorAgentId: reviewerAgentId,
+      authorUserId: null,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      status: "done",
+      completedAt: childUpdatedAt,
+      updatedAt: childUpdatedAt,
+    }));
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([{
+      id: parentIssueId,
+      assigneeAgentId: parentAgentId,
+      blockerIssueIds: [issue.id],
+    }]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: parentIssueId,
+      assigneeAgentId: parentAgentId,
+      childCompletionStateKey: childStateKey,
+      childIssueIds: [issue.id],
+      childIssueSummaries: [{
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        updatedAt: childUpdatedAt,
+        summary: "Review complete.",
+      }],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-review-parent-blocker",
+      }),
+    )
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: reviewBody });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => {
+      const parentCalls = mockHeartbeatService.wakeup.mock.calls.filter(
+        ([agentId, wakeup]) => agentId === parentAgentId && wakeup?.payload?.issueId === parentIssueId,
+      );
+      expect(parentCalls).toHaveLength(1);
+      expect(parentCalls[0]).toEqual([
+        parentAgentId,
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          idempotencyKey: blockerStateKey,
+          payload: expect.objectContaining({
+            completedChildIssueId: issue.id,
+            resolvedBlockerIssueId: issue.id,
+            [ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY]: expect.arrayContaining([
+              blockerStateKey,
+              childStateKey,
+            ]),
+          }),
+        }),
+      ]);
     });
   });
 

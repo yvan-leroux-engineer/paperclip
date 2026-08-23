@@ -1,7 +1,13 @@
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
+import {
+  IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES,
+  IN_FLIGHT_ISSUE_WAKE_STATUSES,
+  ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY,
+  ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY,
+} from "./issue-wakeup-state-keys.js";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
@@ -9,13 +15,6 @@ export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 // for these statuses. The level-triggered state key uses this full set so that
 // one wake for a ready state suppresses further wakes for the SAME state. This
 // bounds reconciliation: after one wake, later passes find the completed row.
-const IDEMPOTENT_DEPENDENCY_WAKE_STATUSES = [
-  "queued",
-  "deferred_issue_execution",
-  "claimed",
-  "completed",
-] as const;
-
 // A wake counts as "still in flight" for these statuses. The `completed` status
 // is not in this set on purpose. Dependency readiness is level-triggered, so a
 // historical completed per-edge wake must never suppress a new wake for the
@@ -109,9 +108,23 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     ),
   ];
 
-  const stateMatch = and(
-    eq(agentWakeupRequests.idempotencyKey, stateKey),
-    inArray(agentWakeupRequests.status, [...IDEMPOTENT_DEPENDENCY_WAKE_STATUSES]),
+  const stateMatch = or(
+    and(
+      or(
+        eq(agentWakeupRequests.idempotencyKey, stateKey),
+        and(
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.dependentIssueId}`,
+          sql`jsonb_typeof(${agentWakeupRequests.payload} -> ${ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY}) = 'array'`,
+          sql`${agentWakeupRequests.payload} -> ${ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY} ? ${stateKey}`,
+        ),
+      ),
+      inArray(agentWakeupRequests.status, [...IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES]),
+    ),
+    and(
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.dependentIssueId}`,
+      sql`${agentWakeupRequests.payload} ->> ${ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY} = 'true'`,
+      inArray(agentWakeupRequests.status, [...IN_FLIGHT_ISSUE_WAKE_STATUSES]),
+    ),
   );
   const legacyMatch =
     legacyKeys.length > 0

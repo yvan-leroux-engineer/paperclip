@@ -1,6 +1,9 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { buildIssueChildrenCompletedWakeStateKey } from "../services/issue-child-completion-wakeups.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
+import { ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY } from "../services/issue-wakeup-state-keys.js";
 
 // The first test in this suite imports the large `routes/issues.ts` module
 // through `vi.importActual` inside `createApp`. `vi.resetModules()` in
@@ -403,5 +406,84 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  it("preserves child and blocker state identities when a completed child also blocks its parent", async () => {
+    const childUpdatedAt = new Date("2026-08-22T12:05:00.000Z");
+    const childState = [{ id: "child-1", status: "done", updatedAt: childUpdatedAt }];
+    const childStateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: "parent-1",
+      children: childState,
+    });
+    const blockerStateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: "parent-1",
+      blockerIssueIds: ["child-1"],
+    });
+    const existing = {
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Last child and blocker",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({ ...existing, status: "done", updatedAt: childUpdatedAt });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([{
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      blockerIssueIds: ["child-1"],
+    }]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      childCompletionStateKey: childStateKey,
+      childIssueIds: ["child-1"],
+      childIssueSummaries: [{
+        id: "child-1",
+        identifier: "PAP-101",
+        title: "Last child and blocker",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: "agent-1",
+        assigneeUserId: null,
+        updatedAt: childUpdatedAt,
+        summary: "Implementation complete.",
+      }],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockWakeup).toHaveBeenCalledTimes(1));
+
+    expect(mockWakeup).toHaveBeenCalledWith(
+      "agent-9",
+      expect.objectContaining({
+        reason: "issue_blockers_resolved",
+        idempotencyKey: blockerStateKey,
+        payload: expect.objectContaining({
+          issueId: "parent-1",
+          resolvedBlockerIssueId: "child-1",
+          completedChildIssueId: "child-1",
+          childIssueSummaries: expect.arrayContaining([
+            expect.objectContaining({ summary: "Implementation complete." }),
+          ]),
+          [ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY]: expect.arrayContaining([
+            blockerStateKey,
+            childStateKey,
+          ]),
+        }),
+      }),
+    );
   });
 });

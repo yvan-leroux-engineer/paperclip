@@ -1,15 +1,11 @@
 import { createHash } from "node:crypto";
+import { IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES } from "./issue-wakeup-state-keys.js";
 
 export const ISSUE_CHILDREN_COMPLETED_WAKE_REASON = "issue_children_completed";
 const ISSUE_CHILDREN_COMPLETED_STATE_KEY_PREFIX = `${ISSUE_CHILDREN_COMPLETED_WAKE_REASON}:state:`;
 
-export const IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES = [
-  "queued",
-  "deferred_issue_execution",
-  "claimed",
-  "coalesced",
-  "completed",
-] as const;
+export const IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES =
+  IDEMPOTENT_ISSUE_WAKE_STATE_STATUSES;
 
 export function buildIssueChildrenCompletedWakeStateKey(input: {
   parentIssueId: string;

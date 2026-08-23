@@ -14,6 +14,19 @@ import {
 } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import {
+  buildIssueChildrenCompletedWakeStateKey,
+} from "../services/issue-child-completion-wakeups.ts";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
+} from "../services/issue-dependency-wakeups.ts";
+import {
+  ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY,
+  ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY,
+  mergeIssueWakeStateKeys,
+  writeIssueWakeStateKeys,
+} from "../services/issue-wakeup-state-keys.ts";
 import { SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY } from "../services/recovery/index.ts";
 import {
   getEmbeddedPostgresTestSupport,
@@ -177,6 +190,329 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
   afterEach(() => {
     runningProcesses.clear();
+  });
+
+  async function seedRunningIssue() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Parent owner",
+      role: "engineer",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      responsibleUserId: "responsible-user",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+    runningProcesses.set(runId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Parent waiting for children",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "parent owner",
+      executionLockedAt: new Date(),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    return { companyId, agentId, issueId, runId };
+  }
+
+  function childCompletionWake(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    agentId: string,
+    issueId: string,
+    stateKey: string,
+  ) {
+    return heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      idempotencyKey: stateKey,
+      payload: { issueId },
+      requestedByActorType: "system",
+      requestedByActorId: "issue_update",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        source: "issue.children_completed",
+        wakeReason: "issue_children_completed",
+      },
+    });
+  }
+
+  it("defers child completion behind an already running parent instead of coalescing it", async () => {
+    const { companyId, agentId, issueId } = await seedRunningIssue();
+    const heartbeat = heartbeatService(db);
+    const stateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: issueId,
+      children: [{ id: randomUUID(), status: "done", updatedAt: new Date() }],
+    });
+
+    expect(await childCompletionWake(heartbeat, agentId, issueId, stateKey)).toBeNull();
+
+    const requests = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, stateKey),
+      ));
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      status: "deferred_issue_execution",
+      reason: "issue_execution_deferred",
+      runId: null,
+    });
+  });
+
+  it("dedupes a state coalesced into a queued run after that run starts", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunningIssue();
+    const heartbeat = heartbeatService(db);
+    const slotHolderRunId = randomUUID();
+    const stateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: issueId,
+      children: [{ id: randomUUID(), status: "done", updatedAt: new Date() }],
+    });
+    runningProcesses.delete(runId);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "queued" })
+      .where(eq(heartbeatRuns.id, runId));
+    // Keep the scheduler's only execution slot occupied so wakeup() leaves the
+    // coalesced target queued. The test can then advance the target explicitly
+    // and deterministically without spawning an adapter process.
+    await db.insert(heartbeatRuns).values({
+      id: slotHolderRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      responsibleUserId: "responsible-user",
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    });
+    runningProcesses.set(slotHolderRunId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    const coalesced = await childCompletionWake(heartbeat, agentId, issueId, stateKey);
+    expect(coalesced?.id).toBe(runId);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running" })
+      .where(eq(heartbeatRuns.id, runId));
+    runningProcesses.set(runId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
+
+    expect(await childCompletionWake(heartbeat, agentId, issueId, stateKey)).toBeNull();
+
+    const requests = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, stateKey),
+      ));
+    expect(requests.filter((request) => request.status === "coalesced")).toHaveLength(1);
+    expect(requests.filter((request) => request.status === "skipped")).toHaveLength(1);
+    expect(requests.filter((request) => request.status === "deferred_issue_execution")).toHaveLength(0);
+  });
+
+  it("preserves multiple child state keys merged into a generic deferred and retries them after failure", async () => {
+    const { companyId, agentId, issueId } = await seedRunningIssue();
+    const heartbeat = heartbeatService(db);
+    const genericIdempotencyKey = `approval:${randomUUID()}`;
+    const stateKeys = [
+      buildIssueChildrenCompletedWakeStateKey({
+        parentIssueId: issueId,
+        children: [{ id: randomUUID(), status: "done", updatedAt: new Date("2026-08-22T12:00:00Z") }],
+      }),
+      buildIssueChildrenCompletedWakeStateKey({
+        parentIssueId: issueId,
+        children: [{ id: randomUUID(), status: "done", updatedAt: new Date("2026-08-22T12:01:00Z") }],
+      }),
+    ];
+
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "approval_approved",
+      idempotencyKey: genericIdempotencyKey,
+      payload: { issueId, approvalId: randomUUID() },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "approval_approved" },
+      requestedByActorType: "system",
+      requestedByActorId: "approval_resolution",
+    });
+    await childCompletionWake(heartbeat, agentId, issueId, stateKeys[0]);
+    await childCompletionWake(heartbeat, agentId, issueId, stateKeys[1]);
+    await childCompletionWake(heartbeat, agentId, issueId, stateKeys[0]);
+
+    const deferred = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(deferred).toMatchObject({ idempotencyKey: genericIdempotencyKey, coalescedCount: 2 });
+    expect((deferred?.payload as Record<string, unknown>)[ISSUE_WAKE_STATE_KEYS_PAYLOAD_KEY])
+      .toEqual(stateKeys);
+
+    const duplicate = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, stateKeys[0]),
+        eq(agentWakeupRequests.status, "skipped"),
+      ));
+    expect(duplicate).toHaveLength(1);
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "failed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, deferred!.id));
+    await childCompletionWake(heartbeat, agentId, issueId, stateKeys[0]);
+
+    const retry = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, stateKeys[0]),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+    expect(retry).toHaveLength(1);
+  });
+
+  it("lets the dependency backstop recognize a blocker state stored as an alias", async () => {
+    const { companyId, agentId, issueId } = await seedRunningIssue();
+    const blockerIssueId = randomUUID();
+    const childStateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: issueId,
+      children: [{ id: blockerIssueId, status: "done", updatedAt: new Date() }],
+    });
+    const blockerStateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: issueId,
+      blockerIssueIds: [blockerIssueId],
+    });
+    const aliases = mergeIssueWakeStateKeys(childStateKey, blockerStateKey);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_same_name",
+      payload: writeIssueWakeStateKeys({ issueId }, aliases),
+      status: "completed",
+      idempotencyKey: childStateKey,
+      finishedAt: new Date(),
+    });
+
+    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
+      companyId,
+      dependentIssueId: issueId,
+      blockerIssueIds: [blockerIssueId],
+    });
+
+    expect(existing).toMatchObject({
+      status: "completed",
+      idempotencyKey: childStateKey,
+    });
+  });
+
+  it("does not let an overflowing carrier suppress state wakes for another issue", async () => {
+    const { companyId, agentId, issueId: firstIssueId } = await seedRunningIssue();
+    const secondIssueId = randomUUID();
+    const secondChildId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId: firstIssueId,
+        [ISSUE_WAKE_STATE_KEYS_OVERFLOW_PAYLOAD_KEY]: true,
+      },
+      status: "deferred_issue_execution",
+    });
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Another parent",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    const stateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: secondIssueId,
+      children: [{ id: secondChildId, status: "done", updatedAt: new Date() }],
+    });
+
+    const run = await childCompletionWake(
+      heartbeatService(db),
+      agentId,
+      secondIssueId,
+      stateKey,
+    );
+    expect(run).not.toBeNull();
+
+    const requests = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, stateKey));
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.status).toBe("queued");
+
+    expect(await findExistingIssueBlockersResolvedWakeForReadyState(db, {
+      companyId,
+      dependentIssueId: secondIssueId,
+      blockerIssueIds: [secondChildId],
+    })).toBeNull();
   });
 
   it("defers approval-approved wakes for a running issue so the assignee resumes after the run", async () => {

@@ -187,6 +187,10 @@ import {
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
 import { ISSUE_CHILDREN_COMPLETED_WAKE_REASON } from "../services/issue-child-completion-wakeups.js";
+import {
+  mergeIssueWakeStateKeys,
+  writeIssueWakeStateKeys,
+} from "../services/issue-wakeup-state-keys.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
   executionWorkspaceService as executionWorkspaceServiceDirect,
@@ -2764,6 +2768,61 @@ function logIssueListRequest(input: {
       visibilityHint: input.req.header("x-paperclip-tab-visible") ?? null,
     }, "safe authenticated GET observed");
   });
+}
+
+type BatchedIssueWakeup = NonNullable<
+  Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1]
+>;
+
+function wakePayloadObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+// A delegated child can also be a formal blocker of its parent. Both route
+// signals then target the same (agent, issue) batch slot. Deliver one dependency
+// wake with the rich child-completion data, but retain both level-triggered
+// state identities in the private request payload so either deduper/backstop
+// recognizes delivery. Keeping the dependency wake canonical also preserves its
+// route activity and makes the backstop's delivery observable.
+function mergeParentCompletionStateWakeups(
+  existing: BatchedIssueWakeup,
+  incoming: BatchedIssueWakeup,
+): BatchedIssueWakeup | null {
+  const pair = [existing.reason, incoming.reason];
+  if (
+    !pair.includes(ISSUE_CHILDREN_COMPLETED_WAKE_REASON) ||
+    !pair.includes(ISSUE_BLOCKERS_RESOLVED_WAKE_REASON)
+  ) {
+    return null;
+  }
+
+  const childWake = existing.reason === ISSUE_CHILDREN_COMPLETED_WAKE_REASON
+    ? existing
+    : incoming;
+  const blockerWake = childWake === existing ? incoming : existing;
+  const childPayload = wakePayloadObject(childWake.payload);
+  const blockerPayload = wakePayloadObject(blockerWake.payload);
+  const stateKeys = mergeIssueWakeStateKeys(
+    blockerPayload,
+    blockerWake.idempotencyKey,
+    childPayload,
+    childWake.idempotencyKey,
+  );
+
+  return {
+    ...blockerWake,
+    payload: writeIssueWakeStateKeys({
+      ...blockerPayload,
+      ...childPayload,
+    }, stateKeys),
+    contextSnapshot: {
+      ...(blockerWake.contextSnapshot ?? {}),
+      ...(childWake.contextSnapshot ?? {}),
+      wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+    },
+  };
 }
 
 export function issueRoutes(
@@ -10551,7 +10610,12 @@ export function issueRoutes(
           wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
             ? wakeup.payload.issueId
             : issue.id;
-        wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
+        const key = `${agentId}:${wakeIssueId}`;
+        const existing = wakeups.get(key);
+        const merged = existing
+          ? mergeParentCompletionStateWakeups(existing.wakeup, wakeup)
+          : null;
+        wakeups.set(key, { agentId, wakeup: merged ?? wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
         agentId: string;
@@ -12606,7 +12670,12 @@ export function issueRoutes(
             ? wakeup.payload.issueId
             : currentIssue.id;
         const key = `${agentId}:${wakeIssueId}`;
-        if (wakeups.has(key)) return;
+        const existing = wakeups.get(key);
+        if (existing) {
+          const merged = mergeParentCompletionStateWakeups(existing.wakeup, wakeup);
+          if (merged) wakeups.set(key, { agentId, wakeup: merged });
+          return;
+        }
         wakeups.set(key, { agentId, wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
