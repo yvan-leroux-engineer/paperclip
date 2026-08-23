@@ -131,6 +131,7 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { buildIssueChildrenCompletedWakeStateKey } from "./issue-child-completion-wakeups.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -6647,6 +6648,11 @@ export function issueService(db: Db) {
         return null;
       }
 
+      // Do not suppress this signal only because the parent has a scheduled
+      // monitor. A monitor does not identify which child state it observed, so
+      // treating every monitor as consumption could hide a real phase unblock.
+      // Exact state consumption is enforced by the wake key at enqueue time.
+
       const childIdsForSummaries = children.slice(0, MAX_CHILD_COMPLETION_SUMMARIES).map((child) => child.id);
       const commentRows = childIdsForSummaries.length > 0
         ? await db
@@ -6679,6 +6685,10 @@ export function issueService(db: Db) {
       return {
         id: parent.id,
         assigneeAgentId: parent.assigneeAgentId,
+        childCompletionStateKey: buildIssueChildrenCompletedWakeStateKey({
+          parentIssueId: parent.id,
+          children,
+        }),
         childIssueIds: children.map((child) => child.id),
         childIssueSummaries,
         childIssueSummaryTruncated: children.length > childIssueSummaries.length,

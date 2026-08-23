@@ -351,6 +351,7 @@ describe("issue dependency wakeups in issue routes", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
       id: "parent-1",
       assigneeAgentId: "agent-9",
+      childCompletionStateKey: "issue_children_completed:state:parent-1:2:test-digest",
       childIssueIds: ["child-0", "child-1"],
       childIssueSummaries: [
         {
@@ -386,6 +387,7 @@ describe("issue dependency wakeups in issue routes", () => {
         "agent-9",
         expect.objectContaining({
           reason: "issue_children_completed",
+          idempotencyKey: "issue_children_completed:state:parent-1:2:test-digest",
           payload: expect.objectContaining({
             issueId: "parent-1",
             completedChildIssueId: "child-1",

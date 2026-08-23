@@ -74,6 +74,10 @@ import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js"
 import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.js";
 import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
+import {
+  IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES,
+  isIssueChildrenCompletedWakeStateKey,
+} from "./issue-child-completion-wakeups.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -18111,6 +18115,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
+        }
+
+        // The issue row lock serializes all wakes for this parent. An exact
+        // child-terminal-state key can therefore be checked and consumed in
+        // the same transaction without a schema migration or a TOCTOU window.
+        // Failed, cancelled, and skipped requests remain retryable.
+        if (isIssueChildrenCompletedWakeStateKey(opts.idempotencyKey)) {
+          const existingChildCompletionWake = await tx
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              inArray(
+                agentWakeupRequests.status,
+                [...IDEMPOTENT_CHILD_COMPLETION_WAKE_STATUSES],
+              ),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+
+          if (existingChildCompletionWake) {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_children_completed_duplicate_state",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {

@@ -186,6 +186,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
+import { ISSUE_CHILDREN_COMPLETED_WAKE_REASON } from "../services/issue-child-completion-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
   executionWorkspaceService as executionWorkspaceServiceDirect,
@@ -10853,7 +10854,8 @@ export function issueRoutes(
           addWakeup(parent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: "issue_children_completed",
+            reason: ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
+            idempotencyKey: parent.childCompletionStateKey,
             payload: {
               issueId: parent.id,
               completedChildIssueId: issue.id,
@@ -10866,7 +10868,7 @@ export function issueRoutes(
             contextSnapshot: {
               issueId: parent.id,
               taskId: parent.id,
-              wakeReason: "issue_children_completed",
+              wakeReason: ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
               source: "issue.children_completed",
               completedChildIssueId: issue.id,
               childIssueIds: parent.childIssueIds,
@@ -12811,7 +12813,8 @@ export function issueRoutes(
           addWakeup(parent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: "issue_children_completed",
+            reason: ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
+            idempotencyKey: parent.childCompletionStateKey,
             payload: {
               issueId: parent.id,
               completedChildIssueId: currentIssue.id,
@@ -12824,7 +12827,7 @@ export function issueRoutes(
             contextSnapshot: {
               issueId: parent.id,
               taskId: parent.id,
-              wakeReason: "issue_children_completed",
+              wakeReason: ISSUE_CHILDREN_COMPLETED_WAKE_REASON,
               source: "issue.children_completed",
               completedChildIssueId: currentIssue.id,
               childIssueIds: parent.childIssueIds,

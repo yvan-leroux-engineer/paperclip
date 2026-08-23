@@ -106,6 +106,7 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
+import { buildIssueChildrenCompletedWakeStateKey } from "../services/issue-child-completion-wakeups.ts";
 import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
@@ -1269,6 +1270,94 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(0);
+  });
+
+  it("queues only one run for concurrent child-completion wakes with the same state", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    const stateKey = buildIssueChildrenCompletedWakeStateKey({
+      parentIssueId: issueId,
+      children: [{
+        id: randomUUID(),
+        status: "done",
+        updatedAt: new Date("2026-08-22T12:00:00.000Z"),
+      }],
+    });
+    await db.insert(agentWakeupRequests).values([
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_children_completed",
+        payload: { issueId },
+        status: "failed",
+        idempotencyKey: stateKey,
+        finishedAt: new Date("2026-08-22T12:01:00.000Z"),
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_children_completed",
+        payload: { issueId },
+        status: "cancelled",
+        idempotencyKey: stateKey,
+        finishedAt: new Date("2026-08-22T12:02:00.000Z"),
+      },
+    ]);
+    let releaseAdapter: (() => void) | null = null;
+    mockAdapterExecute.mockImplementationOnce(() => new Promise((resolve) => {
+      releaseAdapter = () => resolve({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Child completion consumed.",
+        provider: "test",
+        model: "test-model",
+      });
+    }));
+    const heartbeat = heartbeatService(db);
+    const wake = () => heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      idempotencyKey: stateKey,
+      payload: { issueId },
+      requestedByActorType: "system",
+      requestedByActorId: "issue_update",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        source: "issue.children_completed",
+        wakeReason: "issue_children_completed",
+      },
+    });
+
+    const [firstRun, duplicateRun] = await Promise.all([wake(), wake()]);
+
+    expect([firstRun, duplicateRun].filter(Boolean)).toHaveLength(1);
+    const requests = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, stateKey));
+    expect(requests).toHaveLength(4);
+    expect(requests.filter((request) => ["queued", "claimed", "completed", "coalesced"].includes(request.status)))
+      .toHaveLength(1);
+    expect(requests).toContainEqual({
+      status: "skipped",
+      reason: "issue_children_completed_duplicate_state",
+    });
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+
+    const release = await waitForValue(async () => releaseAdapter);
+    expect(release).toBeTypeOf("function");
+    release?.();
+    if (firstRun) await waitForRunToSettle(heartbeat, firstRun.id);
+    if (duplicateRun) await waitForRunToSettle(heartbeat, duplicateRun.id);
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {

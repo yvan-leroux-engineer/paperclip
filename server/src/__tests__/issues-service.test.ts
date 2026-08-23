@@ -4608,6 +4608,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
       id: parentId,
       assigneeAgentId,
+      childCompletionStateKey: expect.stringMatching(
+        new RegExp(`^issue_children_completed:state:${parentId}:2:[a-f0-9]{32}$`),
+      ),
       childIssueIds: [childA, childB],
       childIssueSummaries: [
         expect.objectContaining({ id: childA, title: "Child A", status: "done" }),
