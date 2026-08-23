@@ -48,6 +48,7 @@ const mockTx = vi.hoisted(() => ({
 }));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
+  limit: vi.fn(async () => []),
   orderBy: mockDbSelectOrderBy,
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
     Promise.resolve([]).then(onFulfilled, onRejected),
@@ -314,6 +315,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
     mockDbSelectOrderBy.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
+      limit: vi.fn(async () => []),
       orderBy: mockDbSelectOrderBy,
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([]).then(onFulfilled, onRejected),
